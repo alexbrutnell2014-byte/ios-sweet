@@ -1,0 +1,20 @@
+diff --git a/bsd/dev/sweet_pmem.c b/bsd/dev/sweet_pmem.c
+index deee04d..5d6192b 100644
+--- a/bsd/dev/sweet_pmem.c
++++ b/bsd/dev/sweet_pmem.c
+@@ -76,8 +76,13 @@ struct pmem_rpmh {
+ #define PMEM_RPMH       _IOW('P', 5, struct pmem_rpmh)
+ extern int sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const uint32_t *values);
+ 
+-#define PMEM_MAPS       16              /* 2 MB device windows, round robin */
+-#define PMEM_WIN        0x200000ULL
++/*
++ * surya: one-page device windows. A 2 MB window over the apps SMMU (0x15000000) made every
++ * access through it hang on SM7150 (the hypervisor's stage 2 there), while ml_io_map of the
++ * same registers one page at a time works (sweet_usb.c, sweet_poke.c).
++ */
++#define PMEM_MAPS       64              /* one-page device windows, round robin */
++#define PMEM_WIN        ((uint64_t)PAGE_SIZE)
+ 
+ static struct {
+ 	vm_offset_t va;
