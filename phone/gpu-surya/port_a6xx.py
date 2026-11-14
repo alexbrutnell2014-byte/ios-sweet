@@ -444,6 +444,15 @@ c = sub(c, '''	a6_log("smmu: smr%d %x -> cb%d cbar %x sctlr %x tcr %x tcr2 %x\\n
 		    (uint32_t)cb, rd32(SMR(smr)), rd32(S2CR(smr)));
 	a6_log("smmu: smr%d %x -> cb%d cbar %x sctlr %x tcr %x tcr2 %x\\n", smr, smr >= 0 ? rd32(SMR(smr)) : 0, cb,''', 'smmu readback log')
 
+# HFI v1 queues are not 4-dword aligned (KGSL hfi_queue_write/read pad and align only for HFI >= 2).
+# Third test: INIT acked, then FW_VER/PERF/BW got no ack: the 0xfafafafa padding after INIT was read by
+# the legacy firmware as the next message.
+c = sub(c, '''	for (; w % 4; w = (w + 1) % QSIZE)
+		wr32(QDATA(g, HFI_Q_CMD) + 4 * w, 0xfafafafa);
+''', '''	/* (no 0xfafafafa padding to 4 dwords: HFI v1, KGSL pads only for HFI >= 2) */
+''', 'hfi no pad')
+c = sub(c, '''				r = ((r + 3) & ~3u) % QSIZE;''', '''				r %= QSIZE;	/* HFI v1: no 4-dword alignment */''', 'hfi no align')
+
 os.makedirs(out, exist_ok=True)
 open(os.path.join(out, 'sweet_a6xx.h'), 'w').write(h)
 open(os.path.join(out, 'sweet_a6xx.c'), 'w').write(c)
