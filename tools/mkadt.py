@@ -74,7 +74,7 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, nvt_fw=None):
+def build(seed=None, qemu=False, highmem=False, nvt_fw=None, gpu_fw=None):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     # Carve the panic log off the top so the kernel never allocates over it.
@@ -84,6 +84,14 @@ def build(seed=None, qemu=False, highmem=False, nvt_fw=None):
     seed = seed if seed is not None else os.urandom(64)
     phandle = iter(range(1, 1000))
     ph = lambda: ('AAPL,phandle', u32(next(phandle)))
+
+    # SURYA GPU (bsd/dev/sweet_gpu.c): the phone's own Adreno firmware as /chosen "gpufw,<file>",
+    # never committed (a618_gmu.bin, a630_sqe.fw, a615_zap.mdt and its .bNN segments).
+    gpufw = []
+    if gpu_fw:
+        for f in sorted(os.listdir(gpu_fw)):
+            if f.startswith(('a618_gmu', 'a630_sqe', 'a615_zap.')) and not f.endswith('.elf'):
+                gpufw.append(('gpufw,' + f, open(os.path.join(gpu_fw, f), 'rb').read()))
 
     chosen = node('chosen', [
         ph(),
@@ -121,7 +129,7 @@ def build(seed=None, qemu=False, highmem=False, nvt_fw=None):
         ('effective-production-status-ap', u32(0)),
         ('certificate-security-mode', u32(1)),
         ('effective-security-mode-sep', u32(1)),
-    ], [node('memory-map', [ph()]),
+    ] + gpufw, [node('memory-map', [ph()]),
         # Local boot policy (kern_csr.c): SIP relaxed like `csrutil disable`
         # (lp-sip0: untrusted kexts, unrestricted FS, task_for_pid, kernel
         # debugger, dtrace, nvram), lp-sip1: unauthenticated (unsealed) root.
@@ -249,7 +257,8 @@ def build(seed=None, qemu=False, highmem=False, nvt_fw=None):
 
 if __name__ == '__main__':
     nvt_fw = next((a.split('=', 1)[1] for a in sys.argv if a.startswith('--nvt-fw=')), None)
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, nvt_fw=nvt_fw)
+    gpu_fw = next((a.split('=', 1)[1] for a in sys.argv if a.startswith('--gpu-fw=')), None)
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, nvt_fw=nvt_fw, gpu_fw=gpu_fw)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
