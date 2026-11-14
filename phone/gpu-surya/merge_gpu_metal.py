@@ -238,7 +238,7 @@ assert s.index('static LCK_GRP_DECLARE(sweet_gpu_grp') < s.index('static LCK_MTX
 s = sub(s, 'a6_log("no firmware %s in the device tree (mkpayload.py --gpufw)\\n", name);',
         'a6_log("no firmware %s in the device tree (mkadt.py --gpu-fw)\\n", name);', 'fw msg')
 s = sub(s, '	uint32_t lvl = 4;	/* 499 MHz; boot-arg sweetgpufreq=1 (257) .. 5 (585) */',
-        '	uint32_t lvl = 4;	/* 430 MHz; boot-arg sweetgpufreq=1 (180) .. 4 (430) */', 'freq')
+        '	uint32_t lvl = 5;	/* 565 MHz (NOM); boot-arg sweetgpufreq=1 (180) .. 8 (825) */', 'freq')
 
 # the panel: 1080x2400; which source pipes ABL scans out through is found at run time
 s = sub(s, '#define PANEL_H         2280', '#define PANEL_H         2400', 'panel h')

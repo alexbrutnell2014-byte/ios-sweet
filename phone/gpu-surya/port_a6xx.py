@@ -108,13 +108,13 @@ c = sub(c, '''	a6_log("gmu: init result %x %s, hfi_ctrl %x\\n", r, ok ? "BOOTED"
 	return ok ? 0 : -1;''', '''	a6_log("gmu: init result %x %s, hfi_ctrl %x\\n", r, ok ? "BOOTED" : "timeout", rd32(GMU_REG(GMU_HFI_CTRL)));
 	if (!ok)
 		return -1;
-	if (gmu_rail_on())
+	if (gmu_rail_on(g))
 		return -1;
 	wr32(GMU_REG(0x1f986), 1);				/* HFI_CTRL_INIT */
 	int hrc = wait_bit(GMU_REG(GMU_HFI_CTRL), 1, 1, 100);	/* HFI_CTRL_STATUS bit 0 */
 	a6_log("gmu: hfi init %s (status %x)\\n", hrc ? "TIMEOUT" : "ok", rd32(GMU_REG(GMU_HFI_CTRL)));
 	return hrc ? -1 : 0;''', 'hfi start')
-c = sub(c, 'static int gmu_boot(struct a6_gpu *g)\n{', 'static int gmu_rail_on(void);\n\nstatic int gmu_boot(struct a6_gpu *g)\n{', 'rail_on decl')
+c = sub(c, 'static int gmu_boot(struct a6_gpu *g)\n{', 'static int gmu_rail_on(struct a6_gpu *g);\n\nstatic int gmu_boot(struct a6_gpu *g)\n{', 'rail_on decl')
 
 # HFI v1 exchange: keep the reply's 4th word (FW_VER answers there)
 c = sub(c, '''				if ((hdr & 0xff) != 100 && (buf[1] >> 20) == seq)
@@ -130,9 +130,12 @@ c = sub(c, 'static int hfi_send(struct a6_gpu *g, uint32_t id, uint32_t *msg, ui
 
 # GPU frequency levels: surya qcom,gpu-pwrlevels (825/800/650/565/430/355/267/180 MHz); bring-up at the low four
 c = sub(c, 'static const uint32_t gpu_khz[] = { 0, 257000, 345000, 427000, 499200, 585000 };',
-        'static const uint32_t gpu_khz[] = { 0, 180000, 267000, 355000, 430000 };\t/* surya gpu-pwrlevels, low end */', 'gpu khz')
+        'static const uint32_t gpu_khz[] = { 0, 180000, 267000, 355000, 430000, 565000, 650000, 800000, 825000 };\t/* surya gpu-pwrlevels */', 'gpu khz')
 c = sub(c, 'static const uint32_t gpu_lvl[] = { 0, LVL_LOW_SVS, LVL_SVS, LVL_SVS_L1, LVL_SVS_L2, LVL_NOM };',
-        'static const uint32_t gpu_lvl[] = { 0, LVL_LOW_SVS, LVL_SVS, LVL_SVS_L1, LVL_NOM };', 'gpu lvl')
+        '#define LVL_NOM_L1\t320\n#define LVL_TURBO\t384\n#define LVL_TURBO_L1\t416\n'
+        '/* gpucc-sdmmagpie gx_gfx3d rate_max: 180 MIN_SVS, 267 LOW_SVS, 355 SVS, 430 SVS_L1, 565 NOM, 650 NOM_L1, 800 TURBO, 825 TURBO_L1 */\n'
+        '#define GX_LEVELS\t9\n'
+        'static const uint32_t gpu_lvl[] = { 0, LVL_MIN_SVS, LVL_LOW_SVS, LVL_SVS, LVL_SVS_L1, LVL_NOM, LVL_NOM_L1, LVL_TURBO, LVL_TURBO_L1 };', 'gpu lvl')
 
 # cmd-db: the address of a resource by name (BCM bandwidth votes for the BW table)
 c = sub(c, 'static uint32_t aux16(uint64_t aux, uint32_t i)', '''static uint32_t cmddb_addr(const char *id)
@@ -167,20 +170,21 @@ new_hfi = '''/*
  * registers right after the GMU boots (a6xx_gmu_gfx_rail_on: BOOT_SLUMBER_OPTION, GX/MX_VOTE_IDX and
  * OOB boot_slumber = 6) and powers SPTPRAC, all before the HFI handshake.
  */
-static int gmu_rail_on(void)
+static int gmu_rail_on(struct a6_gpu *g)
 {
-	uint32_t gx[5];
-	if (arc_votes(gx, gpu_lvl, 5, "gfx.lvl", "mx.lvl")) {
+	uint32_t gx[GX_LEVELS];
+	uint32_t lv = g->perf_level >= 1 && g->perf_level < GX_LEVELS ? g->perf_level : 5;
+	if (arc_votes(gx, gpu_lvl, GX_LEVELS, "gfx.lvl", "mx.lvl")) {
 		a6_log("rail: cmd-db levels not found\\n");
 		return -1;
 	}
 	wr32(GMU_REG(0x1cbf8), 0);			/* BOOT_SLUMBER_OPTION = OOB_BOOT_OPTION */
-	wr32(GMU_REG(0x1cbf9), gx[4] & 0xff);		/* GX_VOTE_IDX: gfx arc level (NOM) */
-	wr32(GMU_REG(0x1cbfa), (gx[4] >> 8) & 0xff);	/* MX_VOTE_IDX */
+	wr32(GMU_REG(0x1cbf9), gx[lv] & 0xff);		/* GX_VOTE_IDX: gfx arc level */
+	wr32(GMU_REG(0x1cbfa), (gx[lv] >> 8) & 0xff);	/* MX_VOTE_IDX */
 	wr32(GMU_REG(GMU_H2G_SET), 1u << 22);		/* oob boot_slumber set: BIT(6 + 16) */
 	int ack = wait_bit(GMU_REG(GMU_G2H_INFO), 1u << 30, 1, 1000);
 	wr32(GMU_REG(GMU_G2H_CLR), 1u << 30);
-	a6_log("rail: gx vote %x, oob boot %s, pwr_clk_status %x, rpmh_state %x, gx gdsc %x\\n", gx[4],
+	a6_log("rail: level %u (%u kHz) gx vote %x, oob boot %s, pwr_clk_status %x, rpmh_state %x, gx gdsc %x\\n", lv, gpu_khz[lv], gx[lv],
 	    ack ? "TIMEOUT" : "acked", rd32(GMU_REG(0x1f8d0)), rd32(GMU_REG(GMU_RPMH_STATE)), rd32(GPUCC + GPUCC_GX_GDSCR));
 	if (ack) {
 		wr32(GMU_REG(GMU_H2G_SET), 1u << 30);	/* oob clear */
@@ -196,8 +200,8 @@ static int gmu_rail_on(void)
 static int gmu_hfi(struct a6_gpu *g)
 {
 	static uint32_t msg[256];
-	uint32_t gx[5], cx[2];
-	if (arc_votes(gx, gpu_lvl, 5, "gfx.lvl", "mx.lvl") || arc_votes(cx, gmu_lvl, 2, "cx.lvl", "mx.lvl")) {
+	uint32_t gx[GX_LEVELS], cx[2];
+	if (arc_votes(gx, gpu_lvl, GX_LEVELS, "gfx.lvl", "mx.lvl") || arc_votes(cx, gmu_lvl, 2, "cx.lvl", "mx.lvl")) {
 		a6_log("hfi: cmd-db levels not found\\n");
 		return -1;
 	}
@@ -218,9 +222,9 @@ static int gmu_hfi(struct a6_gpu *g)
 	    (hfi_last[1] >> 16) & 0xfff, hfi_last[1] & 0xffff, rd32(GMU_REG(0x1f981)));
 	/* H2F_MSG_PERF_TBL (4), v1 layout: counts, then {vote, kHz} x MAX_GX_LEVELS 16, x MAX_CX_LEVELS 4 */
 	memset(msg, 0, sizeof(msg));
-	msg[1] = 5;
+	msg[1] = GX_LEVELS;
 	msg[2] = 2;
-	for (int i = 0; i < 5; i++) {
+	for (int i = 0; i < GX_LEVELS; i++) {
 		msg[3 + 2 * i] = gx[i];
 		msg[4 + 2 * i] = gpu_khz[i];
 	}
@@ -229,7 +233,7 @@ static int gmu_hfi(struct a6_gpu *g)
 		msg[4 + 32 + 2 * i] = gmu_khz[i];
 	}
 	rc = hfi_send(g, 4, msg, 3 + 32 + 8);
-	a6_log("hfi v1: PERF_TBL (5 GX, 2 CX levels) -> %d\\n", rc);
+	a6_log("hfi v1: PERF_TBL (%d GX, 2 CX levels) -> %d\\n", GX_LEVELS, rc);
 	/*
 	 * H2F_MSG_BW_VOTE_TBL (3), one level (as mainline a618_build_bw_table): DDR SH0/MC0/ACV and the config
 	 * NoC CN0, by their cmd-db addresses on this SoC. Layout: level, cnoc n, ddr n, cnoc wait, ddr wait,
@@ -263,14 +267,15 @@ static int gmu_hfi(struct a6_gpu *g)
 	memset(msg, 0, sizeof(msg));
 	rc = hfi_send(g, 5, msg, 1);
 	a6_log("hfi v1: TEST -> %d\\n", rc);
-	/* a6xx_gmu_dcvs_nohfi: perf level 4 (430 MHz) at least, bw level 0, OOB dcvs = 7 */
+	/* a6xx_gmu_dcvs_nohfi: the chosen perf level at least (sweetgpufreq), bw level 0, OOB dcvs = 7 */
+	uint32_t lv = g->perf_level >= 1 && g->perf_level < GX_LEVELS ? g->perf_level : 5;
 	wr32(GMU_REG(0x1cbfc), 0);				/* DCVS_ACK_OPTION non-block */
-	wr32(GMU_REG(0x1cbfd), 4u | (3u << 28));		/* FREQ_VOTE(4, CLKSET_OPTION_ATLEAST) */
+	wr32(GMU_REG(0x1cbfd), lv | (3u << 28));		/* FREQ_VOTE(lv, CLKSET_OPTION_ATLEAST) */
 	wr32(GMU_REG(0x1cbfe), 0);				/* BW_VOTE(0) */
 	wr32(GMU_REG(GMU_H2G_SET), 1u << 23);
 	int dack = wait_bit(GMU_REG(GMU_G2H_INFO), 1u << 31, 1, 1000);
 	wr32(GMU_REG(GMU_G2H_CLR), 1u << 31);
-	a6_log("dcvs: oob %s, return %x, pwr_clk_status %x\\n", dack ? "TIMEOUT" : "acked",
+	a6_log("dcvs: level %u (%u kHz): oob %s, return %x, pwr_clk_status %x\\n", lv, gpu_khz[lv], dack ? "TIMEOUT" : "acked",
 	    rd32(GMU_REG(0x1cbff)), rd32(GMU_REG(0x1f8d0)));
 	wr32(GMU_REG(GMU_H2G_SET), 1u << 31);			/* oob clear */
 
