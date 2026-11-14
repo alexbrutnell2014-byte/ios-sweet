@@ -257,6 +257,32 @@ static int smp2p_in_value(const char *name, uint32_t *v)
  * (slave-kernel: 0 err-fatal, 1 ready, 2 handover, 3 stop-ack).
  */
 static uint32_t modem_state = 0xffffffff;
+
+/* surya: the modem's crash string, SMEM item 421 (SMEM_SSR_REASON_MSS0), global area or the modem's */
+static void modem_crash_reason(void)
+{
+	static const unsigned hosts[] = { SMEM_HOST_GLOBAL, SMEM_HOST_MODEM };
+	for (unsigned h = 0; h < 2; h++) {
+		uint64_t pa;
+		uint32_t sz;
+		if (smem_get(hosts[h], 421, &pa, &sz)) {
+			printf("modem crash reason: item 421 not in host %#x\n", hosts[h]);
+			continue;
+		}
+		char buf[513];
+		uint32_t n = sz < 512 ? sz : 512;
+		for (uint32_t i = 0; i < n; i += 4) {
+			uint32_t w = rd32(pa + i);
+			memcpy(buf + i, &w, (n - i) < 4 ? (n - i) : 4);
+		}
+		buf[n] = 0;
+		for (uint32_t i = 0; i < n && buf[i]; i++)
+			if (buf[i] < 32 || buf[i] > 126)
+				buf[i] = '.';
+		printf("modem crash reason (host %#x, %u bytes at %llx): \"%s\"\n", hosts[h], sz, (unsigned long long)pa, buf);
+		return;
+	}
+}
 static void smp2p_service(void)
 {
 	uint64_t ip;
@@ -274,6 +300,8 @@ static void smp2p_service(void)
 	if (smp2p_in_value("slave-kernel", &v) == 0 && v != modem_state) {
 		printf("[%6llu] smp2p: modem state %x%s%s%s%s\n", (unsigned long long)link_ms(), v, v & 1 ? " ERR-FATAL" : "", v & 2 ? " ready" : "",
 		       v & 4 ? " handover" : "", v & 8 ? " stop-ack" : "");
+		if ((v & 1) && !(modem_state != 0xffffffff && (modem_state & 1)))
+			modem_crash_reason();
 		modem_state = v;
 	}
 }
