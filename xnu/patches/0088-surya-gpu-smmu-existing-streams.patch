@@ -1,0 +1,134 @@
+diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
+index 1a3d01a..be0730f 100755
+--- a/bsd/dev/sweet_a6xx.c
++++ b/bsd/dev/sweet_a6xx.c
+@@ -255,12 +255,41 @@ static void smmu_bank(int smr, int cb, uint64_t ttbr0, uint32_t sid, uint32_t ma
+ 	wr32(SMMU + 0x68, 0);					/* TLBIALLNSNH */
+ 	wr32(SMMU + 0x70, 0);					/* TLBGSYNC */
+ 	wait_bit(SMMU + 0x74, 1, 0, 10);
+-	wr32(S2CR(smr), (uint32_t)cb);
+-	wr32(SMR(smr), (1u << 31) | (mask << 16) | sid);
+-	a6_log("smmu: smr%d %x -> cb%d cbar %x sctlr %x tcr %x tcr2 %x\n", smr, rd32(SMR(smr)), cb,
++	if (smr >= 0) {
++		wr32(S2CR(smr), (uint32_t)cb);
++		wr32(SMR(smr), (1u << 31) | (mask << 16) | sid);
++	}
++	a6_log("smmu: smr%d %x -> cb%d cbar %x sctlr %x tcr %x tcr2 %x\n", smr, smr >= 0 ? rd32(SMR(smr)) : 0, cb,
+ 	       rd32(CBAR(cb)), rd32(c + CB_SCTLR), rd32(c + CB_TCR), rd32(c + CB_TCR2));
+ }
+ 
++static void smmu_dump(void)
++{
++	uint32_t idr0 = rd32(SMMU + 0x20), idr1 = rd32(SMMU + 0x24);
++	uint32_t nsmr = idr0 & 0xff, ncb = idr1 & 0xff;
++	a6_log("smmu: idr0 %x idr1 %x: %u SMRs, %u context banks\n", idr0, idr1, nsmr, ncb);
++	for (uint32_t i = 0; i < nsmr && i < 32; i++)
++		a6_log("smmu:   smr%u %08x s2cr %08x\n", i, rd32(SMR(i)), rd32(S2CR(i)));
++	for (uint32_t i = 0; i < ncb && i < 16; i++)
++		a6_log("smmu:   cb%u cbar %08x sctlr %08x\n", i, rd32(CBAR(i)), rd32(SMMU_CB(i) + CB_SCTLR));
++}
++
++/* An enabled SMR that matches sid and whose S2CR translates (type 0) through a context bank: -1 = none */
++static int smmu_find(uint32_t sid, int32_t *smr_out, int32_t *cb_out)
++{
++	uint32_t nsmr = rd32(SMMU + 0x20) & 0xff;
++	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
++		uint32_t m = rd32(SMR(i)), s = rd32(S2CR(i));
++		uint32_t id = m & 0x7fff, mask = (m >> 16) & 0x7fff;
++		if ((m >> 31) && (((id ^ sid) & ~mask) & 0x7fff) == 0 && ((s >> 16) & 3) == 0) {
++			*smr_out = (int32_t)i;
++			*cb_out = (int32_t)(s & 0xff);
++			return 0;
++		}
++	}
++	return -1;
++}
++
+ static int smmu_pick(int32_t *smr_out, int32_t *cb_out, int cb_min)
+ {
+ 	int smr = -1, cb = -1;
+@@ -320,7 +349,14 @@ int a6_clear_fault(const struct a6_gpu *g)
+ 
+ static int gmu_smmu(struct a6_gpu *g)
+ {
+-	if (smmu_pick(&g->gmu_smr, &g->gmu_cb, 0)) {
++	smmu_dump();
++	int32_t esmr, ecb;
++	bool existing = smmu_find(GMU_SID, &esmr, &ecb) == 0;
++	if (existing) {
++		g->gmu_cb = ecb;
++		g->gmu_smr = -1;
++		a6_log("smmu: GMU stream %u already routed by smr%d to cb%d: using that bank\n", GMU_SID, esmr, ecb);
++	} else if (smmu_pick(&g->gmu_smr, &g->gmu_cb, 0)) {
+ 		a6_log("smmu: no free smr/cb\n");
+ 		return -1;
+ 	}
+@@ -335,6 +371,12 @@ static int gmu_smmu(struct a6_gpu *g)
+ 	map_gmu_pages(GMEM_L3_6(g), VA_LOG, GMEM_LOG(g), A6_GMU_LOG_SIZE, 0);
+ 	map_gmu_pages(GMEM_L3_6(g), VA_HFI, GMEM_HFI(g), 0x5000, 0);	/* table + 4 queues */
+ 	smmu_bank(g->gmu_smr, g->gmu_cb, GMEM_L1(g), GMU_SID, GMU_SID_MASK);
++	int32_t vsmr, vcb;
++	if (smmu_find(GMU_SID, &vsmr, &vcb) || vcb != g->gmu_cb) {
++		a6_log("smmu: GMU stream %u does NOT route to cb%d (smr write refused?): not booting the GMU\n",
++		    GMU_SID, g->gmu_cb);
++		return -1;
++	}
+ 	return 0;
+ }
+ 
+@@ -457,11 +499,15 @@ static int gmu_boot(struct a6_gpu *g)
+ 			a6_delay_ms(1);
+ 	}
+ 	a6_log("gmu: init result %x %s, hfi_ctrl %x\n", r, ok ? "BOOTED" : "timeout", rd32(GMU_REG(GMU_HFI_CTRL)));
+-	if (!ok)
++	if (!ok) {
++		wr32(GMU_REG(GMU_SYSRESET), 1);
+ 		return -1;
++	}
+ 	wr32(GMU_REG(0x1f986), 1);				/* HFI_CTRL_INIT */
+ 	int hrc = wait_bit(GMU_REG(GMU_HFI_CTRL), 1, 1, 100);	/* HFI_CTRL_STATUS bit 0 */
+ 	a6_log("gmu: hfi init %s (status %x)\n", hrc ? "TIMEOUT" : "ok", rd32(GMU_REG(GMU_HFI_CTRL)));
++	if (hrc)
++		wr32(GMU_REG(GMU_SYSRESET), 1);
+ 	return hrc ? -1 : 0;
+ }
+ 
+@@ -1059,12 +1105,22 @@ static int gpu_cp_init(struct a6_gpu *g, bool resume);
+ 
+ static int gpu_cp(struct a6_gpu *g)
+ {
+-	if (smmu_pick(&g->gpu_smr, &g->gpu_cb, g->gmu_cb + 1)) {
++	int32_t esmr, ecb;
++	if (smmu_find(GPU_SID, &esmr, &ecb) == 0) {
++		g->gpu_cb = ecb;
++		g->gpu_smr = -1;
++		a6_log("smmu: GPU stream %u already routed by smr%d to cb%d: using that bank\n", GPU_SID, esmr, ecb);
++	} else if (smmu_pick(&g->gpu_smr, &g->gpu_cb, g->gmu_cb + 1)) {
+ 		a6_log("smmu: no free smr/cb for the GPU\n");
+ 		return -1;
+ 	}
+ 	map_gpu_low(g);
+ 	smmu_bank(g->gpu_smr, g->gpu_cb, a6_pool_pa(g, A6_OFF_GT_L1), GPU_SID, GPU_SID_MASK);
++	int32_t vsmr, vcb;
++	if (smmu_find(GPU_SID, &vsmr, &vcb) || vcb != g->gpu_cb) {
++		a6_log("smmu: GPU stream %u does NOT route to cb%d: not starting the CP\n", GPU_SID, g->gpu_cb);
++		return -1;
++	}
+ 	return gpu_cp_init(g, false);
+ }
+ 
+@@ -1137,8 +1193,13 @@ static int gpu_cp_init(struct a6_gpu *g, bool resume)
+ 
+ int a6_power_up(struct a6_gpu *g)
+ {
+-	if (power_cx() || gmu_boot(g) || gmu_hfi(g) || gpu_cp(g))
++	if (power_cx() || gmu_boot(g))
+ 		return -1;
++	if (gmu_hfi(g) || gpu_cp(g)) {
++		wr32(GMU_REG(GMU_SYSRESET), 1);
++		a6_log("bring-up stopped: GMU held in reset\n");
++		return -1;
++	}
+ 	return 0;
+ }
+ 

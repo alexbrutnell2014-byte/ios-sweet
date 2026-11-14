@@ -319,6 +319,120 @@ c = sub(c, '''		/* a6xx_set_ubwc_config: highest bank bit 15 (hbb_lo 2), AMSBC, 
 ''', '''		/* (A640 UBWC config left out: the A618 values come with real rendering) */
 ''', 'ubwc')
 
+# ---------------- GPU SMMU on surya: stream matching is not ours to write ----------------
+# First test: our SMR write read back 0 (locked, the hypervisor's), the context bank registers took our
+# writes, the GMU booted, HFI timed out (its accesses did not go through our tables) and the kernel panicked
+# later (the GMU's VAs most likely went out untranslated). So: log what is there, use an existing
+# translating SMR/S2CR for the stream and program only its context bank; never boot the GMU without one.
+c = sub(c, 'static int smmu_pick(int32_t *smr_out, int32_t *cb_out, int cb_min)', '''static void smmu_dump(void)
+{
+	uint32_t idr0 = rd32(SMMU + 0x20), idr1 = rd32(SMMU + 0x24);
+	uint32_t nsmr = idr0 & 0xff, ncb = idr1 & 0xff;
+	a6_log("smmu: idr0 %x idr1 %x: %u SMRs, %u context banks\\n", idr0, idr1, nsmr, ncb);
+	for (uint32_t i = 0; i < nsmr && i < 32; i++)
+		a6_log("smmu:   smr%u %08x s2cr %08x\\n", i, rd32(SMR(i)), rd32(S2CR(i)));
+	for (uint32_t i = 0; i < ncb && i < 16; i++)
+		a6_log("smmu:   cb%u cbar %08x sctlr %08x\\n", i, rd32(CBAR(i)), rd32(SMMU_CB(i) + CB_SCTLR));
+}
+
+/* An enabled SMR that matches sid and whose S2CR translates (type 0) through a context bank: -1 = none */
+static int smmu_find(uint32_t sid, int32_t *smr_out, int32_t *cb_out)
+{
+	uint32_t nsmr = rd32(SMMU + 0x20) & 0xff;
+	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
+		uint32_t m = rd32(SMR(i)), s = rd32(S2CR(i));
+		uint32_t id = m & 0x7fff, mask = (m >> 16) & 0x7fff;
+		if ((m >> 31) && (((id ^ sid) & ~mask) & 0x7fff) == 0 && ((s >> 16) & 3) == 0) {
+			*smr_out = (int32_t)i;
+			*cb_out = (int32_t)(s & 0xff);
+			return 0;
+		}
+	}
+	return -1;
+}
+
+static int smmu_pick(int32_t *smr_out, int32_t *cb_out, int cb_min)''', 'smmu dump/find')
+
+# smmu_bank: smr < 0 means "the stream already routes to cb": program the bank only
+c = sub(c, '''	wr32(S2CR(smr), (uint32_t)cb);
+	wr32(SMR(smr), (1u << 31) | (mask << 16) | sid);
+	a6_log("smmu: smr%d %x -> cb%d''', '''	if (smr >= 0) {
+		wr32(S2CR(smr), (uint32_t)cb);
+		wr32(SMR(smr), (1u << 31) | (mask << 16) | sid);
+	}
+	a6_log("smmu: smr%d %x -> cb%d''', 'smmu_bank smr')
+c = sub(c, '''	a6_log("smmu: smr%d %x -> cb%d cbar %x sctlr %x tcr %x tcr2 %x\\n", smr, rd32(SMR(smr)), cb,''',
+        '''	a6_log("smmu: smr%d %x -> cb%d cbar %x sctlr %x tcr %x tcr2 %x\\n", smr, smr >= 0 ? rd32(SMR(smr)) : 0, cb,''', 'smmu_bank log')
+
+c = sub(c, '''	if (smmu_pick(&g->gmu_smr, &g->gmu_cb, 0)) {
+		a6_log("smmu: no free smr/cb\\n");
+		return -1;
+	}''', '''	smmu_dump();
+	int32_t esmr, ecb;
+	bool existing = smmu_find(GMU_SID, &esmr, &ecb) == 0;
+	if (existing) {
+		g->gmu_cb = ecb;
+		g->gmu_smr = -1;
+		a6_log("smmu: GMU stream %u already routed by smr%d to cb%d: using that bank\\n", GMU_SID, esmr, ecb);
+	} else if (smmu_pick(&g->gmu_smr, &g->gmu_cb, 0)) {
+		a6_log("smmu: no free smr/cb\\n");
+		return -1;
+	}''', 'gmu_smmu pick')
+c = sub(c, '''	smmu_bank(g->gmu_smr, g->gmu_cb, GMEM_L1(g), GMU_SID, GMU_SID_MASK);
+	return 0;''', '''	smmu_bank(g->gmu_smr, g->gmu_cb, GMEM_L1(g), GMU_SID, GMU_SID_MASK);
+	int32_t vsmr, vcb;
+	if (smmu_find(GMU_SID, &vsmr, &vcb) || vcb != g->gmu_cb) {
+		a6_log("smmu: GMU stream %u does NOT route to cb%d (smr write refused?): not booting the GMU\\n",
+		    GMU_SID, g->gmu_cb);
+		return -1;
+	}
+	return 0;''', 'gmu_smmu verify')
+
+c = sub(c, '''	if (smmu_pick(&g->gpu_smr, &g->gpu_cb, g->gmu_cb + 1)) {
+		a6_log("smmu: no free smr/cb for the GPU\\n");
+		return -1;
+	}''', '''	int32_t esmr, ecb;
+	if (smmu_find(GPU_SID, &esmr, &ecb) == 0) {
+		g->gpu_cb = ecb;
+		g->gpu_smr = -1;
+		a6_log("smmu: GPU stream %u already routed by smr%d to cb%d: using that bank\\n", GPU_SID, esmr, ecb);
+	} else if (smmu_pick(&g->gpu_smr, &g->gpu_cb, g->gmu_cb + 1)) {
+		a6_log("smmu: no free smr/cb for the GPU\\n");
+		return -1;
+	}''', 'gpu pick')
+c = sub(c, '''	smmu_bank(g->gpu_smr, g->gpu_cb, a6_pool_pa(g, A6_OFF_GT_L1), GPU_SID, GPU_SID_MASK);
+	return gpu_cp_init(g, false);''', '''	smmu_bank(g->gpu_smr, g->gpu_cb, a6_pool_pa(g, A6_OFF_GT_L1), GPU_SID, GPU_SID_MASK);
+	int32_t vsmr, vcb;
+	if (smmu_find(GPU_SID, &vsmr, &vcb) || vcb != g->gpu_cb) {
+		a6_log("smmu: GPU stream %u does NOT route to cb%d: not starting the CP\\n", GPU_SID, g->gpu_cb);
+		return -1;
+	}
+	return gpu_cp_init(g, false);''', 'gpu verify')
+
+# A failure after the GMU booted: hold it in reset so it cannot keep running on half-set-up memory
+c = sub(c, '''	if (power_cx() || gmu_boot(g) || gmu_hfi(g) || gpu_cp(g))
+		return -1;
+	return 0;''', '''	if (power_cx() || gmu_boot(g))
+		return -1;
+	if (gmu_hfi(g) || gpu_cp(g)) {
+		wr32(GMU_REG(GMU_SYSRESET), 1);
+		a6_log("bring-up stopped: GMU held in reset\\n");
+		return -1;
+	}
+	return 0;''', 'power_up safe')
+c = sub(c, '''	a6_log("gmu: init result %x %s, hfi_ctrl %x\\n", r, ok ? "BOOTED" : "timeout", rd32(GMU_REG(GMU_HFI_CTRL)));
+	if (!ok)
+		return -1;''', '''	a6_log("gmu: init result %x %s, hfi_ctrl %x\\n", r, ok ? "BOOTED" : "timeout", rd32(GMU_REG(GMU_HFI_CTRL)));
+	if (!ok) {
+		wr32(GMU_REG(GMU_SYSRESET), 1);
+		return -1;
+	}''', 'gmu boot fail reset')
+c = sub(c, '''	a6_log("gmu: hfi init %s (status %x)\\n", hrc ? "TIMEOUT" : "ok", rd32(GMU_REG(GMU_HFI_CTRL)));
+	return hrc ? -1 : 0;''', '''	a6_log("gmu: hfi init %s (status %x)\\n", hrc ? "TIMEOUT" : "ok", rd32(GMU_REG(GMU_HFI_CTRL)));
+	if (hrc)
+		wr32(GMU_REG(GMU_SYSRESET), 1);
+	return hrc ? -1 : 0;''', 'hfi fail reset')
+
 os.makedirs(out, exist_ok=True)
 open(os.path.join(out, 'sweet_a6xx.h'), 'w').write(h)
 open(os.path.join(out, 'sweet_a6xx.c'), 'w').write(c)
