@@ -1,0 +1,19 @@
+surya: keep the Vulkan device after a GPU restart (after UniXNU c72a8a5, "fix(mesa): keep the Vulkan device after
+a GPU restart"). The kernel (SweetAccelerator v2, sweet_gpu.c) recovers from a hang or fault with a soft reset and
+retires the submissions in flight; the device's memory, pipelines and queues stay valid. Marking the device lost made
+backboardd's Metal device refuse everything afterwards (DeviceLost on every surface import) and the UI froze.
+
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -979,8 +979,9 @@
+    if (kr != KERN_SUCCESS)
+       return vk_device_set_lost(&device->vk, "error getting GPU status: 0x%x", kr);
+    if (reply.faults != device->fault_count) {
++      /* The kernel ended this device's submissions in flight at a hang or a fault and restarted the GPU; memory,
++       * pipelines and queues are as they were, so only those command buffers are lost, not the device. */
+       device->fault_count = reply.faults;
+-      return vk_device_set_lost(&device->vk, "GPU faulted or hung");
+    }
+    return VK_SUCCESS;
+ }

@@ -123,7 +123,8 @@ rm -rf out && mkdir -p "$O"
 $IOSCC -x objective-c++ -std=c++17 -fobjc-arc -O2 -g -Wall -Wno-deprecated-declarations -Wno-unused-function -bundle \
 	-o "$O/SweetMetal2" SweetMetal2.mm NativeBridgeMetalFrontend.mm -x none "$BRIDGE" -Wl,-dead_strip -lc++ \
 	-framework Foundation -framework Metal -framework IOSurface -framework IOKit -framework CoreFoundation
-dsymutil "$O/SweetMetal2" -o out/SweetMetal2.dSYM 2>/dev/null || true
+# clang -g leaves the dSYM inside the bundle: move it out before signing
+rm -rf out/SweetMetal2.dSYM; mv "$O/SweetMetal2.dSYM" out/ 2>/dev/null || dsymutil "$O/SweetMetal2" -o out/SweetMetal2.dSYM 2>/dev/null || true
 strip -x "$O/SweetMetal2"
 cp Info.plist "$O/Info.plist"
 cp "$LIB" "$O/libvulkan_freedreno.dylib"
