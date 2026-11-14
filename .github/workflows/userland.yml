@@ -1,0 +1,27 @@
+name: userland
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "phone/**"
+      - ".github/workflows/userland.yml"
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Xcode
+        run: |
+          xcodebuild -version
+          xcrun -sdk iphoneos --show-sdk-version
+      - name: wland (surya)
+        run: sh phone/wifi-surya/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: userland
+          path: phone/wifi-surya/out/
+          retention-days: 30

@@ -30,3 +30,6 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
+
+Phone userland: phone/wifi-surya is a port of ios-flame phone/wifi (MIT, notice above): surya modem
+region, MSA region, WLAN SMMU stream, WLAN rails and board-data selection.
