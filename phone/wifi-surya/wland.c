@@ -747,8 +747,17 @@ static int auto_up(void)
 	struct timeval bt = { 0 };
 	n = sizeof(bt);
 	sysctlbyname("kern.boottime", &bt, &n, NULL, 0);
-	char stamp[32] = "", now[32];
-	snprintf(now, sizeof(now), "%ld\n", (long)bt.tv_sec);
+	/*
+	 * Which boot this is: kern.bootsessionuuid (new every boot). Not kern.boottime alone: without an RTC the
+	 * clock starts near 0 every boot, so boot after boot had the same boottime (51 s) and wland thought it had
+	 * already run - no WiFi.
+	 */
+	char uuid[64] = "";
+	n = sizeof(uuid) - 1;
+	if (sysctlbyname("kern.bootsessionuuid", uuid, &n, NULL, 0) != 0)
+		uuid[0] = 0;
+	char stamp[96] = "", now[96];
+	snprintf(now, sizeof(now), "%s %ld\n", uuid, (long)bt.tv_sec);
 	FILE *f = fopen(WLAND_STAMP, "r");
 	if (f) {
 		if (!fgets(stamp, sizeof(stamp), f))
@@ -767,7 +776,7 @@ static int auto_up(void)
 	if (freopen(WLAND_LOG, "a", stdout))
 		dup2(fileno(stdout), 2);
 	setvbuf(stdout, NULL, _IONBF, 0);
-	printf("wland auto: boot %ld, memory limit 2048 MB -> %d\n", (long)bt.tv_sec, mrc);
+	printf("wland auto: boot %s at %ld, memory limit 2048 MB -> %d\n", uuid, (long)bt.tv_sec, mrc);
 	return up(0);
 }
 
