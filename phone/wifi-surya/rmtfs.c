@@ -20,6 +20,7 @@
 
 #define RMTFS_DIR	"/var/local/fw/rmtfs"
 #define BUF_SIZE	0x200000u
+#define RMTFS_PA	0xE1101000ull	/* surya: fixed, below 4 GB (guard pages at E1100000 and E1301000) */
 #define SECTOR		512
 
 enum { RMTFS_OPEN = 1, RMTFS_CLOSE, RMTFS_RW_IOVEC, RMTFS_ALLOC_BUFF, RMTFS_GET_DEV_ERROR, RMTFS_FORCE_SYNC_IND };
@@ -64,10 +65,13 @@ int rmtfs_init(void)
 		buf_pa = fpa;
 		printf("rmtfs: buffer %llx from this boot's first run\n", (unsigned long long)buf_pa);
 	} else {
-		uint64_t a = pm_alloc(BUF_SIZE + 0x2000, 0x1000);
-		if (!a)
-			return -1;
-		buf_pa = a + 0x1000;
+		/*
+		 * surya: below 4 GB, as Android's qcom,rmtfs_sharedmem. pm_alloc memory is XNU's (above
+		 * 4 GB on surya, highmem): the modem's access to it ended in "modem_xpu_int.c:444:XPU
+		 * violation". DRAM below 4 GB is not XNU's; radio.c's pool is 0xE0000000..0xE1000000.
+		 * A 4K guard page on each side (qcom,guard-memory).
+		 */
+		buf_pa = RMTFS_PA;
 		static const uint32_t src[] = { VMID_HLOS }, dst[] = { VMID_HLOS, VMID_MSS_MSA };
 		if (hyp_assign(buf_pa, BUF_SIZE, src, 1, dst, 2))
 			return -1;
