@@ -1,0 +1,141 @@
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 1981490..ae06974 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -88,9 +88,10 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ {
+ 	/* Restrict access to the battery blocks; keys retain their own lanes. */
+ 	unsigned peripheral = addr >> 8;
+-	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
++	bool wled = sid == 5 && (peripheral == 0xd8 || peripheral == 0xd9);
++	if (!sp_ready || !out || addr > 0xffffu || (!wled && (sid != 0 ||
+ 	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48)) {
++	    peripheral != 0x13 && peripheral != 0x48)))) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+@@ -123,4 +124,50 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	IOLockUnlock(sp_lock);
+ 	return -1;
+ }
++/*
++ * surya: the LCD backlight is the PM6150L WLED (SID 5, ctrl 0xd800, sink 0xd900), owned by the apps EE.
++ * Writes go through that APID's own channel (chnls 0x0c600000 + 0x10000 * APID), EXT_WRITEL.
++ * Only the WLED blocks are writable.
++ */
++#define SP_CHNLS_PA 0x0c600000u
++int
++sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val)
++{
++	unsigned peripheral = addr >> 8;
++	if (!sp_ready || sid != 5 || addr > 0xffffu || (peripheral != 0xd8 && peripheral != 0xd9)) {
++		return -1;
++	}
++	IOLockLock(sp_lock);
++	uint16_t apid = sp_find_apid((sid << 8) | peripheral);
++	if (apid == SP_NO_APID || sp_poisoned[apid] || (sp_rd(sp_cfg, 0x700u + 4u * apid) & 7u) != 0) {
++		IOLockUnlock(sp_lock);
++		return -1;
++	}
++	static vm_offset_t chan[2];
++	vm_offset_t ch = chan[peripheral & 1];
++	if (!ch) {
++		ch = chan[peripheral & 1] = ml_io_map(SP_CHNLS_PA + 0x10000u * apid, 0x1000);
++		if (!ch) {
++			IOLockUnlock(sp_lock);
++			return -1;
++		}
++	}
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(ch + 0x10u) = val;			/* WDATA0 */
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(ch + 0x00u) = (addr & 0xffu) << 4;	/* EXT_WRITEL (0), BC=0 */
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t status = sp_rd(ch, 0x08u);
++		if (status & 1u) {
++			IOLockUnlock(sp_lock);
++			return (status & 0x0eu) ? -1 : 0;
++		}
++		delay(1);
++	}
++	sp_poisoned[apid] = true;
++	printf("SWEET WLED: SPMI write timeout addr=%#x APID=%u disabled\n", addr, apid);
++	IOLockUnlock(sp_lock);
++	return -1;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_spmi.h b/bsd/dev/sweet_spmi.h
+index 45565d1..ce7628c 100644
+--- a/bsd/dev/sweet_spmi.h
++++ b/bsd/dev/sweet_spmi.h
+@@ -8,6 +8,8 @@ extern "C" {
+ int sweet_spmi_init(void);
+ /* Thread context only; 0 success, -1 failure; *out unchanged on failure. */
+ int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++/* surya WLED (SID 5, 0xd800/0xd900) only; thread context. */
++int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val);
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a62416c..fb9f295 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -37,6 +37,37 @@
+ #include "SweetSurface.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
++extern "C" int sweet_spmi_init(void);   /* bsd/dev/sweet_spmi.c */
++extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++extern "C" int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val);
++
++/*
++ * surya is an LCD: black pixels still glow, so display off must also stop the backlight.
++ * PM6150L WLED MOD_EN (SID 5, 0xd846) bit 7 is the module enable (mainline qcom-wled
++ * wled_module_enable); the value found at the first off is restored on.
++ */
++static void
++sweet_backlight(bool on)
++{
++	static int saved = -1;
++	uint8_t v = 0;
++	if (sweet_spmi_init() || sweet_spmi_read(5, 0xd846, &v)) {
++		IOLog("SWEET FB: backlight: WLED not reachable\n");
++		return;
++	}
++	if (!on) {
++		if (v & 0x80) {
++			saved = v;
++		}
++		v &= 0x7f;
++	} else {
++		v = saved >= 0 ? (uint8_t)saved : (uint8_t)(v | 0x80);
++	}
++	int rc = sweet_spmi_write(5, 0xd846, v);
++	uint8_t back = 0xff;
++	(void)sweet_spmi_read(5, 0xd846, &back);
++	IOLog("SWEET FB: backlight %s: mod_en %#x -> rc %d, reads %#x\n", on ? "on" : "off", v, rc, back);
++}
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -534,6 +565,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		break;
+ 	case kSweetFBRequestPowerChange:
+ 		if (args->scalarInputCount >= 1) {
++			uint32_t bl = 1;	/* sweetbl=0 keeps the backlight alone */
+ 			bool off = args->scalarInput[0] == 0;
+ 			IOLockLock(fFB->fLock);
+ 			if (off != fFB->fPowerOff) {
+@@ -543,6 +575,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			}
+ 			IOLockUnlock(fFB->fLock);
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
++			if (!PE_parse_boot_argn("sweetbl", &bl, sizeof(bl)) || bl) {
++				sweet_backlight(!off);
++			}
+ 		}
+ 		break;
+ 	case kSweetFBSwapWait:
