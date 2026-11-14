@@ -1,0 +1,53 @@
+diff --git a/bsd/dev/sweet_pmem.c b/bsd/dev/sweet_pmem.c
+index 5d6192b..b1f0be3 100644
+--- a/bsd/dev/sweet_pmem.c
++++ b/bsd/dev/sweet_pmem.c
+@@ -41,6 +41,7 @@
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ extern boolean_t pmap_valid_address(uint64_t pa);
+ extern vm_map_address_t phystokv(uint64_t pa);
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
+ extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
+ extern void _disable_preemption(void);
+@@ -93,6 +94,12 @@ static struct {
+ 	uint64_t win;
+ } pm_map[PMEM_MAPS];
+ static unsigned pm_map_next;
++#define PMEM_IOMAPS     256             /* permanent ml_io_map pages */
++static struct {
++	vm_offset_t va;
++	uint64_t win;
++} pm_iomap[PMEM_IOMAPS];
++static unsigned pm_iomap_n;
+ static uint32_t pm_bounce[PAGE_SIZE / 4];
+ 
+ static LCK_GRP_DECLARE(sweet_pmem_grp, "sweet_pmem");
+@@ -107,7 +114,27 @@ static LCK_MTX_DECLARE(sweet_pmem_lock, &sweet_pmem_grp);
+ static volatile uint32_t *
+ pm_io(uint64_t pa)
+ {
++	/*
++	 * surya: permanent one-page ml_io_map mappings, as sweet_poke.c and sweet_usb.c use. Accesses
++	 * through ml_io_map_unmappable windows (kernel_map) hung on SM7150 for the apps SMMU even with
++	 * one-page windows, while ml_io_map of the same page works. The io_submap is small, so the
++	 * table only grows for distinct pages; past PMEM_IOMAPS it falls back to a recycled window.
++	 */
+ 	uint64_t win = pa & ~(PMEM_WIN - 1);
++	for (unsigned i = 0; i < pm_iomap_n; i++) {
++		if (pm_iomap[i].win == win) {
++			return (volatile uint32_t *)(pm_iomap[i].va + (pa - win));
++		}
++	}
++	if (pm_iomap_n < PMEM_IOMAPS) {
++		vm_offset_t va = ml_io_map((vm_offset_t)win, PMEM_WIN);
++		if (va) {
++			pm_iomap[pm_iomap_n].va = va;
++			pm_iomap[pm_iomap_n].win = win;
++			pm_iomap_n++;
++			return (volatile uint32_t *)(va + (pa - win));
++		}
++	}
+ 	for (unsigned i = 0; i < PMEM_MAPS; i++) {
+ 		if (pm_map[i].va && pm_map[i].win == win) {
+ 			return (volatile uint32_t *)(pm_map[i].va + (pa - win));
