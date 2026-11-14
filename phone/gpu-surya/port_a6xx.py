@@ -453,6 +453,24 @@ c = sub(c, '''	for (; w % 4; w = (w + 1) % QSIZE)
 ''', 'hfi no pad')
 c = sub(c, '''				r = ((r + 3) & ~3u) % QSIZE;''', '''				r %= QSIZE;	/* HFI v1: no 4-dword alignment */''', 'hfi no align')
 
+# GX on: KGSL a6xx_gmu_gx_is_on reads GMU SPTPRAC_PWR_CLK_STATUS (0x1f8d0) and wants GX_GDSC_POWER_OFF
+# (bit 6) and GX_CLK_OFF (bit 7) clear. The GMU switches GX itself; GPUCC's GX GDSCR does not show it
+# (fourth test: all HFI acked, OOB acked, GDSCR 0x222001 -> "GX not powered").
+c = sub(c, '''bool a6_gx_up(void)
+{
+	return a6_cx_up() && is_on(GPUCC + GPUCC_GX_GDSCR);
+}''', '''bool a6_gx_up(void)
+{
+	/* KGSL a6xx_gmu_gx_is_on: SPTPRAC_PWR_CLK_STATUS without GX_GDSC_POWER_OFF (6) / GX_CLK_OFF (7) */
+	return a6_cx_up() && !(rd32(GMU_REG(0x1f8d0)) & ((1u << 6) | (1u << 7)));
+}''', 'gx_up')
+c = sub(c, '''	a6_log("oob gpu_set %s, gx gdsc %x\\n", ack ? "TIMEOUT" : "acked", rd32(GPUCC + GPUCC_GX_GDSCR));
+	if (!a6_gx_up()) {''', '''	for (int t = 0; t < 100 && !a6_gx_up(); t++)
+		a6_delay_ms(1);
+	a6_log("oob gpu_set %s, gx gdsc %x, gmu pwr_clk_status %x, rpmh_state %x\\n", ack ? "TIMEOUT" : "acked",
+	    rd32(GPUCC + GPUCC_GX_GDSCR), rd32(GMU_REG(0x1f8d0)), rd32(GMU_REG(GMU_RPMH_STATE)));
+	if (!a6_gx_up()) {''', 'oob log')
+
 os.makedirs(out, exist_ok=True)
 open(os.path.join(out, 'sweet_a6xx.h'), 'w').write(h)
 open(os.path.join(out, 'sweet_a6xx.c'), 'w').write(c)

@@ -1,0 +1,26 @@
+diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
+index 4be572f..9c26dd1 100755
+--- a/bsd/dev/sweet_a6xx.c
++++ b/bsd/dev/sweet_a6xx.c
+@@ -168,7 +168,8 @@ bool a6_cx_up(void)
+ 
+ bool a6_gx_up(void)
+ {
+-	return a6_cx_up() && is_on(GPUCC + GPUCC_GX_GDSCR);
++	/* KGSL a6xx_gmu_gx_is_on: SPTPRAC_PWR_CLK_STATUS without GX_GDSC_POWER_OFF (6) / GX_CLK_OFF (7) */
++	return a6_cx_up() && !(rd32(GMU_REG(0x1f8d0)) & ((1u << 6) | (1u << 7)));
+ }
+ 
+ bool a6_cp_running(const struct a6_gpu *g)
+@@ -734,7 +735,10 @@ static int gmu_hfi(struct a6_gpu *g)
+ 	wr32(GMU_REG(GMU_H2G_SET), 1u << 16);
+ 	int ack = wait_bit(GMU_REG(GMU_G2H_INFO), 1u << 24, 1, 1000);
+ 	wr32(GMU_REG(GMU_G2H_CLR), 1u << 24);
+-	a6_log("oob gpu_set %s, gx gdsc %x\n", ack ? "TIMEOUT" : "acked", rd32(GPUCC + GPUCC_GX_GDSCR));
++	for (int t = 0; t < 100 && !a6_gx_up(); t++)
++		a6_delay_ms(1);
++	a6_log("oob gpu_set %s, gx gdsc %x, gmu pwr_clk_status %x, rpmh_state %x\n", ack ? "TIMEOUT" : "acked",
++	    rd32(GPUCC + GPUCC_GX_GDSCR), rd32(GMU_REG(0x1f8d0)), rd32(GMU_REG(GMU_RPMH_STATE)));
+ 	if (!a6_gx_up()) {
+ 		a6_log("GX not powered; not touching GPU registers\n");
+ 		return -1;
