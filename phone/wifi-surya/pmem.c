@@ -7,6 +7,18 @@
 #include "pmem.h"
 
 static int pm_fd = -1;
+static int pm_trace = -1;	/* WLAND_PMEM_TRACE=1: every access on stderr before it happens */
+
+static void trace(const char *what, uint64_t pa, size_t len)
+{
+	if (pm_trace < 0)
+		pm_trace = getenv("WLAND_PMEM_TRACE") != NULL;
+	if (pm_trace) {
+		fprintf(stderr, "pmem %s %llx+%zu\n", what, (unsigned long long)pa, len);
+		fflush(stderr);
+		fsync(2);
+	}
+}
 
 void pm_init(void)
 {
@@ -22,6 +34,7 @@ void pm_init(void)
 
 int pm_rd(uint64_t pa, void *buf, size_t len)
 {
+	trace("rd", pa, len);
 	ssize_t n = pread(pm_fd, buf, len, (off_t)pa);
 	if (n != (ssize_t)len) {
 		fprintf(stderr, "pmem: read %zu at %llx: %s\n", len, (unsigned long long)pa,
@@ -33,6 +46,7 @@ int pm_rd(uint64_t pa, void *buf, size_t len)
 
 int pm_wr(uint64_t pa, const void *buf, size_t len)
 {
+	trace("wr", pa, len);
 	ssize_t n = pwrite(pm_fd, buf, len, (off_t)pa);
 	if (n != (ssize_t)len) {
 		fprintf(stderr, "pmem: write %zu at %llx: %s\n", len, (unsigned long long)pa,
