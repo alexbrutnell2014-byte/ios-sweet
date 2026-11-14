@@ -74,7 +74,7 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False):
+def build(seed=None, qemu=False, highmem=False, nvt_fw=None):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     # Carve the panic log off the top so the kernel never allocates over it.
@@ -219,6 +219,11 @@ def build(seed=None, qemu=False, highmem=False):
         ('opposed-power-vol-buttons', u32(1)),
     ])
 
+    # SURYA touch (bsd/dev/sweet_nvt.c): the Novatek NT36672C has no flash and
+    # needs its firmware downloaded on every boot. The blob is the phone's own
+    # /vendor/firmware/novatek_ts_huaxing_fw.bin and is never committed.
+    nvt = [node('sweet-nvt', [ph(), ('firmware', open(nvt_fw, 'rb').read())])] if nvt_fw else []
+
     product_props = d22ap_product()
     product = [node('product', [ph()] + product_props)] if product_props else []
 
@@ -238,11 +243,13 @@ def build(seed=None, qemu=False, highmem=False):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu else [ufs])
+       + nvt)
 
 
 if __name__ == '__main__':
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv)
+    nvt_fw = next((a.split('=', 1)[1] for a in sys.argv if a.startswith('--nvt-fw=')), None)
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, nvt_fw=nvt_fw)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

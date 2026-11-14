@@ -1,0 +1,923 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 6630131..244df7d 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
++bsd/dev/sweet_nvt.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/dev/sweet_nvt.c b/bsd/dev/sweet_nvt.c
+new file mode 100755
+index 0000000..7d87888
+--- /dev/null
++++ b/bsd/dev/sweet_nvt.c
+@@ -0,0 +1,869 @@
++/*
++ * SURYA (Poco X3 NFC) touch: Novatek NT36672C TDDI on QUP0 SE0 GENI SPI.
++ * Selected with boot-arg sweettouch=2 (bsd/dev/sweet_touch.c).
++ *
++ * Hardware (live surya FDT): spi@880000 (QUP wrapper0 SE0), pins gpio49-52
++ * function qup00 (TLMM WEST), reset gpio8 / irq gpio9 (TLMM NORTH), vddio
++ * pm6150 L18 (RPMh ldoa18, 1.8 V), LAB/IBB already on for the panel.
++ * Protocol from Xiaomi/LineageOS drivers/input/touchscreen/nt36xxx_spi:
++ * trim id 0C xx xx 72 66 03 -> NT36675 memory map, hw_crc = 2, host
++ * download of the firmware on every power-up (it has no flash).
++ *
++ * The firmware blob is NOT in this tree: tools/mkadt.py --nvt-fw=FILE puts
++ * the phone's own /vendor/firmware/novatek_ts_huaxing_fw.bin into the ADT
++ * node /sweet-nvt "firmware".
++ *
++ * Polled like sweet_touch.c: one kernel thread, no GIC interrupt handler.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++void sweet_nvt_init(void);
++
++/* ---- addresses ---- */
++#define NVT_SE_PA        0x00880000u   /* QUP0 SE0 */
++#define NVT_GCC_PA       0x00100000u
++#define NVT_NORTH_PA     0x03900000u   /* TLMM 0x3400000 + NORTH 0x500000 */
++#define NVT_WEST_PA      0x03500000u   /* TLMM 0x3400000 + WEST 0x100000 */
++#define NVT_GCC_VOTE     0x5200cu
++#define NVT_GCC_MASK     (0x1fu << 6)  /* wrap0 m_ahb 6, s_ahb 7, core 8, core2x 9, s0 10 */
++#define NVT_RCG          0x17034u      /* gcc_qupv3_wrap0_s0_clk_src cmd_rcgr */
++#define NVT_GPIO_CFG(n)  ((uint32_t)(n) * 0x1000u)
++#define NVT_GPIO_IO(n)   (NVT_GPIO_CFG(n) + 4u)
++#define NVT_PIN_RST      8u
++#define NVT_PIN_IRQ      9u
++
++/* ---- GENI SE registers ---- */
++#define SE_FORCE_DEFAULT 0x020u
++#define SE_OUTPUT_CTRL   0x024u
++#define SE_CGC_CTRL      0x028u
++#define SE_STATUS        0x040u
++#define SE_M_CLK_CFG     0x048u
++#define SE_FIFO_DISABLE  0x064u
++#define SE_FW_REV        0x068u
++#define SE_CLK_SEL       0x07cu
++#define SE_SPI_CPHA      0x224u
++#define SE_SPI_LOOPBACK  0x22cu
++#define SE_SPI_CPOL      0x230u
++#define SE_SPI_DEMUX_INV 0x24cu
++#define SE_SPI_DEMUX_SEL 0x250u
++#define SE_BYTE_GRAN     0x254u
++#define SE_DMA_MODE      0x258u
++#define SE_SPI_TRANS_CFG 0x25cu
++#define SE_TX_PACK0      0x260u
++#define SE_TX_PACK1      0x264u
++#define SE_SPI_WORD_LEN  0x268u
++#define SE_SPI_TX_LEN    0x26cu
++#define SE_SPI_RX_LEN    0x270u
++#define SE_SPI_PRE_POST  0x274u
++#define SE_SPI_DELAYS    0x278u
++#define SE_RX_PACK0      0x284u
++#define SE_RX_PACK1      0x288u
++#define SE_M_CMD         0x600u
++#define SE_M_CMD_CTRL    0x604u
++#define SE_M_IRQ         0x610u
++#define SE_M_IRQ_EN      0x614u
++#define SE_M_IRQ_CLR     0x618u
++#define SE_S_IRQ_EN      0x644u
++#define SE_S_IRQ_CLR     0x648u
++#define SE_TX_FIFO       0x700u
++#define SE_RX_FIFO       0x780u
++#define SE_TX_STATUS     0x800u
++#define SE_RX_STATUS     0x804u
++#define SE_TX_WM         0x80cu
++#define SE_RX_WM         0x810u
++#define SE_RX_RFR_WM     0x814u
++#define SE_GSI_EVENT_EN  0xe18u
++#define SE_IRQ_ROUTE_EN  0xe1cu
++#define SE_HW_TX         0xe24u
++#define SE_HW_RX         0xe28u
++#define SE_DMA_GEN_CFG   0xe30u
++
++#define M_DONE           (1u << 0)
++#define M_ABORT          (1u << 5)
++#define M_ERRORS         ((1u << 1) | (1u << 2) | (1u << 3) | (3u << 24) | (3u << 28))
++#define M_EVENTS         (M_DONE | M_ERRORS | (1u << 4) | M_ABORT | (3u << 26) | (1u << 30))
++#define SPI_TX_ONLY      1u
++#define SPI_FULL_DUPLEX  3u
++/* 8-bit words, 4 per FIFO word, MSB first on the wire (same as sweet_touch.c). */
++#define SE_PACK0         0x0007f8feu
++#define SE_PACK1         0x000ffefeu
++
++/* ---- Novatek NT36672C (NT36675 map, hw_crc 2) ---- */
++#define NVT_ENG_RST      0x7fff80u
++#define NVT_SWRST_N8     0x3f0feu       /* DT novatek,swrst-n8-addr */
++#define NVT_SPI_RD_FAST  0x3f310u       /* DT novatek,spi-rd-fast-addr */
++#define NVT_EVENT_BUF    0x22d00u
++#define NVT_BOOT_RDY     0x3f10du
++#define NVT_ILM_LEN      0x3f118u
++#define NVT_DLM_LEN      0x3f130u
++#define NVT_ILM_DES      0x3f128u
++#define NVT_DLM_DES      0x3f12cu
++#define NVT_G_ILM_CRC    0x3f100u
++#define NVT_G_DLM_CRC    0x3f104u
++#define NVT_R_ILM_CRC    0x3f120u
++#define NVT_BLD_CRC_EN   0x3f30eu
++#define NVT_BLD_CRC_FLAG 0x3f133u
++#define EV_HOST_CMD      0x50u
++#define EV_HANDSHAKE     0x51u
++#define EV_RESET_DONE    0x60u
++#define EV_FWINFO        0x78u
++#define EV_PROJECTID     0x9au
++#define NVT_POINT_LEN    65u
++#define NVT_MAX          10u
++#define NVT_W            1080
++#define NVT_H            2400
++#define NVT_MAX_PART     32u
++#define NVT_CHUNK        4096u
++
++struct nvt_part {
++	uint32_t bin, sram, size, crc;
++};
++
++static struct {
++	vm_offset_t se, gcc, north, west;
++	unsigned tx_depth;
++	bool started, dead;
++	const uint8_t *fw;
++	uint32_t fw_size, fw_need;
++	struct nvt_part part[NVT_MAX_PART];
++	unsigned nparts;
++	uint32_t active;
++	int x[NVT_MAX], y[NVT_MAX];
++	uint32_t last_irq;
++} nv;
++static int nvt_sleep_chan;
++
++static uint32_t
++rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++nvt_sleep(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&nvt_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static bool
++wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
++{
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (!(rd(base, off) & mask)) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++/* TLMM: pull[1:0] mux[5:2] drive[8:6] (mA/2-1) oe[9]; IO: in[0] out[1]. */
++static void
++gpio_cfg(vm_offset_t tile, unsigned pin, unsigned mux, unsigned pull,
++    unsigned drive, bool out, bool high)
++{
++	if (out) {
++		wr(tile, NVT_GPIO_IO(pin),
++		    (rd(tile, NVT_GPIO_IO(pin)) & ~2u) | (high ? 2u : 0u));
++	}
++	uint32_t cfg = rd(tile, NVT_GPIO_CFG(pin)) & ~0x3ffu;
++	cfg |= pull | (mux << 2) | (drive << 6) | (out ? 0x200u : 0u);
++	wr(tile, NVT_GPIO_CFG(pin), cfg);
++}
++
++static void
++gpio_set(vm_offset_t tile, unsigned pin, bool high)
++{
++	wr(tile, NVT_GPIO_IO(pin), (rd(tile, NVT_GPIO_IO(pin)) & ~2u) | (high ? 2u : 0u));
++}
++
++/* ---- clocks ---- */
++static int
++nvt_clocks(void)
++{
++	wr(nv.gcc, NVT_GCC_VOTE, rd(nv.gcc, NVT_GCC_VOTE) | NVT_GCC_MASK);
++	uint32_t dfs = rd(nv.gcc, NVT_RCG + 0x14u);
++	printf("SWEET NVT: gcc vote=%#x rcg=%#x cfg=%#x dfs=%#x\n",
++	    rd(nv.gcc, NVT_GCC_VOTE), rd(nv.gcc, NVT_RCG), rd(nv.gcc, NVT_RCG + 4u), dfs);
++	int level = -1;
++	if (dfs & 1u) {
++		/* DFS: choose a performance level that is XO (19.2 MHz) / 1. */
++		for (unsigned l = 0; l < 8; ++l) {
++			uint32_t c = rd(nv.gcc, NVT_RCG + 0x1cu + 4u * l);
++			printf("SWEET NVT: dfs level%u cfg=%#x\n", l, c);
++			if (level < 0 && (c & 0x371fu) == 1u) {
++				level = (int)l;
++			}
++		}
++		if (level < 0) {
++			printf("SWEET NVT: no XO/1 DFS level; stopping\n");
++			return -1;
++		}
++	} else {
++		uint32_t cfg = rd(nv.gcc, NVT_RCG + 4u);
++		cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;
++		wr(nv.gcc, NVT_RCG + 4u, cfg);
++		wr(nv.gcc, NVT_RCG, rd(nv.gcc, NVT_RCG) | 1u);
++		if (!wait_clear(nv.gcc, NVT_RCG, 1u)) {
++			printf("SWEET NVT: RCG update timeout\n");
++			return -1;
++		}
++		level = 0;
++	}
++	const uint32_t branches[] = {0x17004, 0x17008, 0x1700c, 0x17014, 0x17030};
++	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
++		if (!wait_clear(nv.gcc, branches[i], 1u << 31)) {
++			printf("SWEET NVT: GCC branch %#x halted (%#x)\n", branches[i],
++			    rd(nv.gcc, branches[i]));
++			return -1;
++		}
++	}
++	return level;
++}
++
++/* ---- GENI SPI master (FIFO mode, polled) ---- */
++static bool
++spi_init(unsigned clk_level)
++{
++	uint32_t fw = rd(nv.se, SE_FW_REV);
++	uint32_t tx = rd(nv.se, SE_HW_TX), rx = rd(nv.se, SE_HW_RX);
++	printf("SWEET NVT: se0 fw=%#x proto=%u status=%#x tx=%#x rx=%#x fifo-dis=%#x\n",
++	    fw, (fw >> 8) & 0xffu, rd(nv.se, SE_STATUS), tx, rx, rd(nv.se, SE_FIFO_DISABLE));
++	if (((fw >> 8) & 0xffu) != 1u || (rd(nv.se, SE_FIFO_DISABLE) & 1u) ||
++	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u ||
++	    ((tx >> 16) & 0x3fu) < 2u || ((rx >> 16) & 0x3fu) < 2u) {
++		printf("SWEET NVT: need SPI firmware on SE0 and 32-bit FIFOs; stopping\n");
++		return false;
++	}
++	if (rd(nv.se, SE_STATUS) & 0x1001u) {
++		printf("SWEET NVT: SE0 busy; stopping\n");
++		return false;
++	}
++	nv.tx_depth = (tx >> 16) & 0x3fu;
++	wr(nv.se, SE_GSI_EVENT_EN, 0);
++	wr(nv.se, SE_IRQ_ROUTE_EN, 0);          /* poll, no GIC routing */
++	wr(nv.se, SE_S_IRQ_EN, 0);
++	wr(nv.se, SE_M_IRQ_CLR, 0xffffffffu);
++	wr(nv.se, SE_S_IRQ_CLR, 0xffffffffu);
++	wr(nv.se, SE_DMA_MODE, 0);              /* FIFO mode */
++	wr(nv.se, SE_CGC_CTRL, rd(nv.se, SE_CGC_CTRL) | 0x7fu);
++	wr(nv.se, SE_DMA_GEN_CFG, rd(nv.se, SE_DMA_GEN_CFG) | 0x0fu);
++	wr(nv.se, SE_OUTPUT_CTRL, 0x7f);
++	wr(nv.se, SE_FORCE_DEFAULT, 1);
++	/* SPI mode 0, CS0, no loopback, CS stays asserted for the whole command. */
++	wr(nv.se, SE_SPI_LOOPBACK, rd(nv.se, SE_SPI_LOOPBACK) & ~3u);
++	wr(nv.se, SE_SPI_CPOL, rd(nv.se, SE_SPI_CPOL) & ~4u);
++	wr(nv.se, SE_SPI_CPHA, rd(nv.se, SE_SPI_CPHA) & ~1u);
++	wr(nv.se, SE_SPI_DEMUX_SEL, 0);
++	wr(nv.se, SE_SPI_DEMUX_INV, 0);
++	wr(nv.se, SE_SPI_TRANS_CFG, rd(nv.se, SE_SPI_TRANS_CFG) & ~1u);
++	wr(nv.se, SE_SPI_DELAYS, 0);
++	wr(nv.se, SE_SPI_PRE_POST, 0);
++	wr(nv.se, SE_SPI_WORD_LEN, (rd(nv.se, SE_SPI_WORD_LEN) & ~0x3ffu) | (8u - 4u));
++	/* 19.2 MHz / 4 = 4.8 MHz (the IC allows 8 MHz). */
++	wr(nv.se, SE_CLK_SEL, clk_level & 7u);
++	wr(nv.se, SE_M_CLK_CFG, (4u << 4) | 1u);
++	wr(nv.se, SE_BYTE_GRAN, 0);
++	wr(nv.se, SE_TX_PACK0, SE_PACK0);
++	wr(nv.se, SE_TX_PACK1, SE_PACK1);
++	wr(nv.se, SE_RX_PACK0, SE_PACK0);
++	wr(nv.se, SE_RX_PACK1, SE_PACK1);
++	wr(nv.se, SE_TX_WM, 0);
++	wr(nv.se, SE_RX_WM, 0);
++	wr(nv.se, SE_RX_RFR_WM, ((rx >> 16) & 0x3fu) - 1u);
++	wr(nv.se, SE_M_IRQ_EN, M_EVENTS);
++	if (rd(nv.se, SE_TX_PACK0) != SE_PACK0 || rd(nv.se, SE_RX_PACK1) != SE_PACK1 ||
++	    (rd(nv.se, SE_TX_STATUS) & 0xfffffffu) || (rd(nv.se, SE_RX_STATUS) & 0x1ffffffu)) {
++		printf("SWEET NVT: SE0 setup readback mismatch; stopping\n");
++		return false;
++	}
++	printf("SWEET NVT: spi ready clk_sel=%u mclk=%#x word=%#x tx-depth=%u\n",
++	    rd(nv.se, SE_CLK_SEL), rd(nv.se, SE_M_CLK_CFG), rd(nv.se, SE_SPI_WORD_LEN), nv.tx_depth);
++	return true;
++}
++
++static void
++spi_abort(void)
++{
++	wr(nv.se, SE_M_CMD_CTRL, 2);
++	bool done = false;
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (rd(nv.se, SE_M_IRQ) & M_ABORT) {
++			done = true;
++			break;
++		}
++		delay(1);
++	}
++	for (unsigned i = 0; i < 64 && (rd(nv.se, SE_RX_STATUS) & 0x1ffffffu); ++i) {
++		(void)rd(nv.se, SE_RX_FIFO);
++	}
++	wr(nv.se, SE_M_IRQ_CLR, 0xffffffffu);
++	if (!done || (rd(nv.se, SE_STATUS) & 1u)) {
++		nv.dead = true;
++		printf("SWEET NVT: spi abort failed status=%#x; stopping\n", rd(nv.se, SE_STATUS));
++	}
++}
++
++/*
++ * One CS-framed SPI command. TX bytes are hdr[0..hl) then data[0..dl).
++ * rx (if non-NULL) receives hl+dl bytes clocked in at the same time.
++ */
++static int
++spi_xfer(const uint8_t *hdr, unsigned hl, const uint8_t *data, unsigned dl, uint8_t *rx)
++{
++	unsigned len = hl + dl, pos = 0, got = 0;
++	if (nv.dead || !len || len > 0xffffffu) {
++		return EIO;
++	}
++	if (!wait_clear(nv.se, SE_STATUS, 1u)) {
++		nv.dead = true;
++		return EBUSY;
++	}
++	wr(nv.se, SE_M_IRQ_CLR, 0xffffffffu);
++	wr(nv.se, SE_SPI_TX_LEN, len);
++	if (rx) {
++		wr(nv.se, SE_SPI_RX_LEN, len);
++	}
++	wr(nv.se, SE_M_CMD, (rx ? SPI_FULL_DUPLEX : SPI_TX_ONLY) << 27);
++	/* ~2 us per byte at 4.8 MHz incl. polling; generous bound. */
++	unsigned limit = 20000u + len * 8u;
++	for (unsigned it = 0; it < limit; ++it) {
++		uint32_t irq = rd(nv.se, SE_M_IRQ);
++		nv.last_irq = irq;
++		if (irq & M_ERRORS) {
++			printf("SWEET NVT: spi error irq=%#x len=%u pos=%u got=%u\n", irq, len, pos, got);
++			spi_abort();
++			return EIO;
++		}
++		while (pos < len) {
++			uint32_t used = rd(nv.se, SE_TX_STATUS) & 0xfffffffu;
++			if (used >= nv.tx_depth) {
++				break;
++			}
++			uint32_t word = 0;
++			for (unsigned j = 0; j < 4 && pos < len; ++j, ++pos) {
++				uint8_t b = pos < hl ? hdr[pos] : data[pos - hl];
++				word |= (uint32_t)b << (8u * j);
++			}
++			wr(nv.se, SE_TX_FIFO, word);
++		}
++		if (rx) {
++			uint32_t count = rd(nv.se, SE_RX_STATUS) & 0x1ffffffu;
++			while (count--) {
++				uint32_t word = rd(nv.se, SE_RX_FIFO);
++				for (unsigned j = 0; j < 4 && got < len; ++j) {
++					rx[got++] = (uint8_t)(word >> (8u * j));
++				}
++			}
++		}
++		if (irq & M_DONE) {
++			if (rx) {
++				uint32_t count = rd(nv.se, SE_RX_STATUS) & 0x1ffffffu;
++				while (count--) {
++					uint32_t word = rd(nv.se, SE_RX_FIFO);
++					for (unsigned j = 0; j < 4 && got < len; ++j) {
++						rx[got++] = (uint8_t)(word >> (8u * j));
++					}
++				}
++			}
++			wr(nv.se, SE_M_IRQ_CLR, irq);
++			if (pos == len && (!rx || got == len)) {
++				return 0;
++			}
++			printf("SWEET NVT: spi short len=%u pos=%u got=%u irq=%#x\n", len, pos, got, irq);
++			return EIO;
++		}
++		wr(nv.se, SE_M_IRQ_CLR, irq & ((3u << 26) | (1u << 30)));
++		if (it > 64) {
++			delay(1);
++		}
++	}
++	printf("SWEET NVT: spi timeout len=%u pos=%u got=%u irq=%#x status=%#x\n",
++	    len, pos, got, nv.last_irq, rd(nv.se, SE_STATUS));
++	spi_abort();
++	return ETIMEDOUT;
++}
++
++/* ---- Novatek register access (CTP_SPI_READ / CTP_SPI_WRITE) ---- */
++static int
++nvt_write(const uint8_t *buf, unsigned len)
++{
++	uint8_t h = buf[0] | 0x80u;
++	return spi_xfer(&h, 1, buf + 1, len - 1, NULL);
++}
++
++/* buf[0] = offset; on return buf[1..len) holds the data (vendor layout). */
++static int
++nvt_read(uint8_t *buf, unsigned len)
++{
++	uint8_t tx[NVT_POINT_LEN + 8], rx[NVT_POINT_LEN + 8];
++	if (len + 1 > sizeof(tx)) {
++		return EINVAL;
++	}
++	memcpy(tx, buf, len);
++	tx[0] &= 0x7fu;
++	tx[len] = 0;                       /* DUMMY_BYTES = 1 */
++	int err = spi_xfer(tx, len + 1, NULL, 0, rx);
++	if (!err) {
++		memcpy(buf + 1, rx + 2, len - 1);
++	}
++	return err;
++}
++
++static int
++nvt_set_page(uint32_t addr)
++{
++	uint8_t b[3] = {0xff, (uint8_t)(addr >> 15), (uint8_t)(addr >> 7)};
++	return nvt_write(b, 3);
++}
++
++static int
++nvt_write_addr(uint32_t addr, uint8_t v)
++{
++	int err = nvt_set_page(addr);
++	if (!err) {
++		uint8_t b[2] = {(uint8_t)(addr & 0x7fu), v};
++		err = nvt_write(b, 2);
++	}
++	return err;
++}
++
++static void
++nvt_bootloader_reset(void)
++{
++	(void)nvt_write_addr(NVT_SWRST_N8, 0x69);
++	delay(5000);
++	(void)nvt_write_addr(NVT_SPI_RD_FAST, 0x00);
++}
++
++static bool
++nvt_trim(void)
++{
++	for (unsigned retry = 0; retry < 5; ++retry) {
++		nvt_bootloader_reset();
++		uint8_t b[7] = {0x4e, 0, 0, 0, 0, 0, 0};
++		int err = nvt_set_page(0x1f64eu);
++		if (!err) {
++			err = nvt_read(b, 7);
++		}
++		printf("SWEET NVT: trim err=%d id=%02x %02x %02x %02x %02x %02x\n",
++		    err, b[1], b[2], b[3], b[4], b[5], b[6]);
++		if (!err && b[1] == 0x0c && b[4] == 0x72 && b[5] == 0x66 && b[6] == 0x03) {
++			return true;
++		}
++		nvt_sleep(10);
++	}
++	return false;
++}
++
++/* ---- firmware (host download with hardware CRC) ---- */
++static uint32_t
++le32(const uint8_t *p)
++{
++	return p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++static bool
++nvt_fw_parse(void)
++{
++	const uint8_t *fw = nv.fw;
++	uint32_t size = nv.fw_size;
++	nv.fw_need = 0;
++	for (uint32_t i = size / 4096u; i > 0; --i) {
++		const uint8_t *f = fw + i * 4096u - 3u;
++		if ((f[0] == 'N' && f[1] == 'V' && f[2] == 'T') ||
++		    (f[0] == 'M' && f[1] == 'O' && f[2] == 'D')) {
++			nv.fw_need = i * 4096u;
++			break;
++		}
++	}
++	if (!nv.fw_need || nv.fw_need < 4096u) {
++		printf("SWEET NVT: firmware end flag not found\n");
++		return false;
++	}
++	const uint8_t *ver = fw + nv.fw_need - 4096u;
++	if ((uint8_t)(ver[0] + ver[1]) != 0xff) {
++		printf("SWEET NVT: firmware version check failed %02x/%02x\n", ver[0], ver[1]);
++		return false;
++	}
++	uint32_t end = le32(fw), info = 0;
++	for (uint32_t pos = 0x30; pos < end; pos += 0x10) {
++		++info;
++	}
++	unsigned ovly = (fw[0x28] & 0x10u) ? (fw[0x28] & 0x0fu) : 0u;
++	nv.nparts = 2u + ovly + info;
++	if (nv.nparts > NVT_MAX_PART || end > size) {
++		printf("SWEET NVT: bad header parts=%u end=%#x\n", nv.nparts, end);
++		return false;
++	}
++	for (unsigned l = 0; l < nv.nparts; ++l) {
++		struct nvt_part *p = &nv.part[l];
++		if (l < 2) {
++			p->bin = le32(fw + l * 12u);
++			p->sram = le32(fw + 4u + l * 12u);
++			p->size = le32(fw + 8u + l * 12u);
++			p->crc = le32(fw + 0x18u + l * 4u);
++		} else {
++			uint32_t pos = (l < 2u + info) ? 0x30u + 0x10u * (l - 2u)
++			    : nv.part[1].bin + 0x10u * (l - 2u - info);
++			if (pos + 16u > size) {
++				return false;
++			}
++			p->sram = le32(fw + pos);
++			p->size = le32(fw + pos + 4u);
++			p->bin = le32(fw + pos + 8u);
++			p->crc = le32(fw + pos + 12u);
++		}
++		if ((uint64_t)p->bin + p->size > size) {
++			printf("SWEET NVT: part %u out of range bin=%#x size=%#x\n", l, p->bin, p->size);
++			return false;
++		}
++	}
++	printf("SWEET NVT: firmware %u bytes need=%#x ver=%#x parts=%u (info %u ovly %u) ilm=%#x@%#x dlm=%#x@%#x\n",
++	    size, nv.fw_need, ver[0], nv.nparts, info, ovly,
++	    nv.part[0].size, nv.part[0].sram, nv.part[1].size, nv.part[1].sram);
++	return true;
++}
++
++static int
++nvt_write_sram(uint32_t sram, const uint8_t *src, uint32_t size)
++{
++	while (size) {
++		uint32_t n = size < NVT_CHUNK ? size : NVT_CHUNK;
++		int err = nvt_set_page(sram);
++		if (!err) {
++			uint8_t h = (uint8_t)((sram & 0x7fu) | 0x80u);
++			err = spi_xfer(&h, 1, src, n, NULL);
++		}
++		if (err) {
++			return err;
++		}
++		sram += n;
++		src += n;
++		size -= n;
++	}
++	return 0;
++}
++
++static void
++nvt_crc_bank(uint32_t des, uint32_t sram, uint32_t lenaddr, uint32_t size, uint32_t gaddr, uint32_t crc)
++{
++	(void)nvt_set_page(des);
++	uint8_t a[4] = {(uint8_t)(des & 0x7f), (uint8_t)sram, (uint8_t)(sram >> 8), (uint8_t)(sram >> 16)};
++	(void)nvt_write(a, 4);
++	uint8_t b[4] = {(uint8_t)(lenaddr & 0x7f), (uint8_t)size, (uint8_t)(size >> 8), (uint8_t)((size >> 16) & 1u)};
++	(void)nvt_write(b, 4);           /* hw_crc > 1: 3 length bytes */
++	uint8_t c[5] = {(uint8_t)(gaddr & 0x7f), (uint8_t)crc, (uint8_t)(crc >> 8),
++		        (uint8_t)(crc >> 16), (uint8_t)(crc >> 24)};
++	(void)nvt_write(c, 5);
++}
++
++static bool
++nvt_reset_state(void)
++{
++	(void)nvt_set_page(NVT_EVENT_BUF | EV_RESET_DONE);
++	uint8_t b[6] = {0};
++	for (unsigned retry = 0; retry <= 10; ++retry) {
++		b[0] = EV_RESET_DONE;
++		b[1] = 0;
++		int err = nvt_read(b, 6);
++		if (!err && b[1] >= 0xa0 && b[1] <= 0xaf) {
++			return true;
++		}
++		nvt_sleep(10);
++	}
++	printf("SWEET NVT: reset state %02x %02x %02x %02x %02x\n", b[1], b[2], b[3], b[4], b[5]);
++	return false;
++}
++
++static void
++nvt_read_crc_debug(void)
++{
++	uint8_t b[5] = {(uint8_t)(NVT_BLD_CRC_FLAG & 0x7f), 0, 0, 0, 0};
++	(void)nvt_set_page(NVT_BLD_CRC_FLAG);
++	(void)nvt_read(b, 2);
++	printf("SWEET NVT: crc flags=%#x (done=%u ilm=%u dlm=%u)\n", b[1],
++	    (b[1] >> 2) & 1u, b[1] & 1u, (b[1] >> 1) & 1u);
++	uint8_t r[9] = {(uint8_t)(NVT_R_ILM_CRC & 0x7f)};
++	(void)nvt_set_page(NVT_R_ILM_CRC);
++	(void)nvt_read(r, 9);
++	printf("SWEET NVT: crc ilm bin=%#x got=%#x dlm bin=%#x got=%#x\n",
++	    nv.part[0].crc, le32(r + 1), nv.part[1].crc, le32(r + 5));
++}
++
++static bool
++nvt_download(void)
++{
++	for (unsigned retry = 0; retry < 3; ++retry) {
++		uint64_t t0 = mach_absolute_time();
++		nvt_bootloader_reset();
++		int err = 0;
++		for (unsigned l = 0; l < nv.nparts && !err; ++l) {
++			struct nvt_part *p = &nv.part[l];
++			if (!p->size) {
++				continue;
++			}
++			/* The vendor writes size + 1 bytes. */
++			uint32_t n = p->size + ((p->bin + p->size + 1u <= nv.fw_size) ? 1u : 0u);
++			err = nvt_write_sram(p->sram, nv.fw + p->bin, n);
++		}
++		if (err) {
++			printf("SWEET NVT: firmware write failed %d (try %u)\n", err, retry);
++			continue;
++		}
++		nvt_crc_bank(NVT_ILM_DES, nv.part[0].sram, NVT_ILM_LEN, nv.part[0].size,
++		    NVT_G_ILM_CRC, nv.part[0].crc);
++		nvt_crc_bank(NVT_DLM_DES, nv.part[1].sram, NVT_DLM_LEN, nv.part[1].size,
++		    NVT_G_DLM_CRC, nv.part[1].crc);
++		/* BLD CRC enable: read-modify-write bit 7. */
++		uint8_t b[2] = {(uint8_t)(NVT_BLD_CRC_EN & 0x7f), 0xff};
++		(void)nvt_set_page(NVT_BLD_CRC_EN);
++		(void)nvt_read(b, 2);
++		b[0] = (uint8_t)(NVT_BLD_CRC_EN & 0x7f);
++		b[1] |= 0x80u;
++		(void)nvt_write(b, 2);
++		/* Clear reset status, enable FW CRC. */
++		(void)nvt_set_page(NVT_EVENT_BUF);
++		uint8_t c[2] = {EV_RESET_DONE, 0};
++		(void)nvt_write(c, 2);
++		uint8_t d[2] = {EV_HOST_CMD, 0xae};
++		(void)nvt_write(d, 2);
++		/* Boot ready (hw_crc: no POR_CD step). */
++		(void)nvt_write_addr(NVT_BOOT_RDY, 1);
++		delay(5000);
++		bool ok = nvt_reset_state();
++		uint64_t ns;
++		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++		printf("SWEET NVT: download try %u %s in %llu ms\n", retry, ok ? "ok" : "FAILED",
++		    (unsigned long long)(ns / 1000000u));
++		if (ok) {
++			return true;
++		}
++		nvt_read_crc_debug();
++	}
++	return false;
++}
++
++static void
++nvt_fw_info(void)
++{
++	uint8_t b[17] = {EV_FWINFO};
++	(void)nvt_set_page(NVT_EVENT_BUF | EV_FWINFO);
++	int err = nvt_read(b, 17);
++	printf("SWEET NVT: fwinfo err=%d ver=%#x/%#x x_num=%u y_num=%u max=%ux%u type=%#x\n",
++	    err, b[1], b[2], b[3], b[4], (b[5] << 8) | b[6], (b[7] << 8) | b[8], b[14]);
++	uint8_t p[3] = {EV_PROJECTID};
++	(void)nvt_set_page(NVT_EVENT_BUF | EV_PROJECTID);
++	(void)nvt_read(p, 3);
++	printf("SWEET NVT: pid=%04x\n", (p[2] << 8) | p[1]);
++	(void)nvt_set_page(NVT_EVENT_BUF);
++}
++
++/* ---- touch reports ---- */
++static void
++nvt_report(uint32_t mask, const int *x, const int *y)
++{
++	for (unsigned id = 0; id < NVT_MAX; ++id) {
++		uint32_t bit = 1u << id;
++		if (mask & bit) {
++			if (!(nv.active & bit) || x[id] != nv.x[id] || y[id] != nv.y[id]) {
++				sweet_hid_touch((int)id, 1, x[id], y[id]);
++			}
++			nv.x[id] = x[id];
++			nv.y[id] = y[id];
++		} else if (nv.active & bit) {
++			sweet_hid_touch((int)id, 0, nv.x[id], nv.y[id]);
++		}
++	}
++	nv.active = mask;
++}
++
++static int
++nvt_poll(bool verbose)
++{
++	uint8_t b[NVT_POINT_LEN + 1] = {0};
++	int x[NVT_MAX] = {0}, y[NVT_MAX] = {0};
++	uint32_t mask = 0;
++	int err = nvt_set_page(NVT_EVENT_BUF);
++	if (!err) {
++		err = nvt_read(b, NVT_POINT_LEN + 1);
++	}
++	if (err) {
++		return err;
++	}
++	if (verbose) {
++		printf("SWEET NVT: frame %02x %02x %02x %02x %02x %02x | %02x %02x %02x %02x %02x %02x\n",
++		    b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12]);
++	}
++	for (unsigned i = 0; i < NVT_MAX; ++i) {
++		const uint8_t *p = b + 1u + 6u * i;
++		unsigned id = p[0] >> 3, state = p[0] & 7u;
++		if (id == 0 || id > NVT_MAX) {
++			continue;
++		}
++		if (state != 1u && state != 2u) {
++			continue;
++		}
++		unsigned px = ((unsigned)p[1] << 4) | (p[3] >> 4);
++		unsigned py = ((unsigned)p[2] << 4) | (p[3] & 0x0fu);
++		if (px >= NVT_W || py >= NVT_H) {
++			continue;
++		}
++		mask |= 1u << (id - 1u);
++		x[id - 1u] = (int)px;
++		y[id - 1u] = (int)py;
++	}
++	nvt_report(mask, x, y);
++	return 0;
++}
++
++static bool
++nvt_bring_up(void)
++{
++	/* Reset low, eng reset, reset high: vendor probe order. */
++	gpio_set(nv.north, NVT_PIN_RST, false);
++	delay(1000);
++	(void)nvt_write_addr(NVT_ENG_RST, 0x5a);
++	delay(1000);
++	gpio_set(nv.north, NVT_PIN_RST, true);
++	nvt_sleep(10);
++	if (!nvt_trim()) {
++		return false;
++	}
++	if (!nvt_download()) {
++		return false;
++	}
++	nvt_fw_info();
++	return true;
++}
++
++static void
++nvt_thread(void *arg, wait_result_t result)
++{
++	unsigned delay_s = 45, l18 = 1;
++	unsigned int fwsize = 0;
++	void const *fw = NULL;
++	DTEntry entry;
++	(void)arg;
++	(void)result;
++	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
++	(void)PE_parse_boot_argn("sweetnvtl18", &l18, sizeof(l18));
++	printf("SWEET NVT: starting in %u s\n", delay_s);
++	nvt_sleep(delay_s * 1000u);
++
++	if (SecureDTFindEntry("name", "sweet-nvt", &entry) != kSuccess ||
++	    SecureDTGetProperty(entry, "firmware", &fw, &fwsize) != kSuccess || fwsize < 8192) {
++		printf("SWEET NVT: no /sweet-nvt firmware in the device tree (mkadt --nvt-fw); stopping\n");
++		goto out;
++	}
++	nv.fw = (const uint8_t *)fw;
++	nv.fw_size = fwsize;
++	if (!nvt_fw_parse()) {
++		goto out;
++	}
++
++	nv.gcc = ml_io_map(NVT_GCC_PA, 0x60000);
++	nv.north = ml_io_map(NVT_NORTH_PA, 0x10000);
++	nv.west = ml_io_map(NVT_WEST_PA, 0x40000);
++	nv.se = ml_io_map(NVT_SE_PA, 0x4000);
++	if (!nv.gcc || !nv.north || !nv.west || !nv.se) {
++		printf("SWEET NVT: MMIO mapping failed\n");
++		goto out;
++	}
++	printf("SWEET NVT: TLMM rst cfg=%#x io=%#x irq cfg=%#x io=%#x spi49 cfg=%#x 52 cfg=%#x\n",
++	    rd(nv.north, NVT_GPIO_CFG(NVT_PIN_RST)), rd(nv.north, NVT_GPIO_IO(NVT_PIN_RST)),
++	    rd(nv.north, NVT_GPIO_CFG(NVT_PIN_IRQ)), rd(nv.north, NVT_GPIO_IO(NVT_PIN_IRQ)),
++	    rd(nv.west, NVT_GPIO_CFG(49)), rd(nv.west, NVT_GPIO_CFG(52)));
++
++	int level = nvt_clocks();
++	if (level < 0 || !spi_init((unsigned)level)) {
++		goto out;
++	}
++	/* qup00 = function 2 on gpio49-52; 6 mA, no pull (DT qupv3_se0_spi_active). */
++	for (unsigned pin = 49; pin <= 52; ++pin) {
++		gpio_cfg(nv.west, pin, 2, 0, 2, false, false);
++	}
++	gpio_cfg(nv.north, NVT_PIN_IRQ, 0, 0, 0, false, false);
++	gpio_cfg(nv.north, NVT_PIN_RST, 0, 0, 0, true, true);
++
++	bool up = nvt_bring_up();
++	if (!up && l18 && !nv.dead) {
++		printf("SWEET NVT: no answer; voting vddio L18A 1.8 V and retrying\n");
++		int e = sweet_rpmh_vreg_enable("ldoa18", 1800);
++		if (e) {
++			printf("SWEET NVT: L18A vote failed %d\n", e);
++		} else {
++			nvt_sleep(20);
++			up = nvt_bring_up();
++		}
++	}
++	if (!up) {
++		printf("SWEET NVT: bring-up failed (dead=%d); stopping\n", nv.dead);
++		goto out;
++	}
++
++	printf("SWEET NVT: touch running, poll 8 ms\n");
++	unsigned errors = 0, frames = 0;
++	while (!nv.dead) {
++		int err = nvt_poll(frames < 3 || (nv.active == 0 && (frames % 1000u) == 0));
++		++frames;
++		if (err) {
++			if ((errors++ % 100u) == 0) {
++				printf("SWEET NVT: poll err=%d irq=%#x\n", err, nv.last_irq);
++			}
++			if (errors == 10) {
++				nvt_report(0, nv.x, nv.y);
++			}
++		} else {
++			errors = 0;
++		}
++		nvt_sleep(8);
++	}
++	nvt_report(0, nv.x, nv.y);
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++sweet_nvt_init(void)
++{
++	thread_t thread;
++	if (nv.started) {
++		return;
++	}
++	nv.started = true;
++	kern_return_t kr = kernel_thread_start(nvt_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET NVT: kernel_thread_start failed %d\n", kr);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 4da50d8..380f28d 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -328,8 +328,11 @@ int
+ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ {
+ 	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary resources. */
+-	if (!res || strcmp(res, "ldoc11") || mv < 2950 || mv > 3400) {
+-		printf("SWEET RPMH: expected ldoc11 and 2950..3400 mV\n");
++	/* ldoc11: sweet touch (2950..3400 mV); ldoa18: surya NT36672C vddio (1.8 V). */
++	bool l11c = res && !strcmp(res, "ldoc11") && mv >= 2950 && mv <= 3400;
++	bool l18a = res && !strcmp(res, "ldoa18") && mv >= 1650 && mv <= 1950;
++	if (!l11c && !l18a) {
++		printf("SWEET RPMH: expected ldoc11 2950..3400 mV or ldoa18 1650..1950 mV\n");
+ 		return EINVAL;
+ 	}
+ 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 03defe6..60ec125 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -646,6 +646,13 @@ sweet_touch_init(void)
+ 	st.started = true;
+ 	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
+ 	(void)PE_parse_boot_argn("sweettouchirq", &st.irq_hint, sizeof(st.irq_hint));
++	if (enabled == 2) {
++		/* SURYA (Poco X3 NFC): Novatek NT36672C on GENI SPI, bsd/dev/sweet_nvt.c */
++		extern void sweet_nvt_init(void);
++		printf("SWEET TOUCH: sweettouch=2, Novatek SPI driver\n");
++		sweet_nvt_init();
++		return;
++	}
+ 	if (!enabled) {
+ 		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
+ 		return;
