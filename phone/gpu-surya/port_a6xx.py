@@ -23,6 +23,8 @@ def sub(text, old, new, what):
 # ---------------- header: addresses and identity ----------------
 h = sub(h, ' * Adreno 640 core shared', ' * Adreno 618 core (surya: Poco X3 NFC, SM7150), ported from ios-flame\'s Adreno 640 core shared', 'h title')
 h = sub(h, '#define A6_FB_PA\t\t0x9c400000ull', '#define A6_FB_PA\t\t0x9c000000ull\t/* surya cont_splash_region */', 'fb')
+h = sub(h, '#define A6_FB_SIZE\t\t0xa00000ull\t/* mapped for the GPU: 5 x 2 MB */',
+        '#define A6_FB_SIZE\t\t0xc00000ull\t/* mapped for the GPU: 6 x 2 MB (2400 rows of 4352 bytes = 10.4 MB) */', 'fb size')
 h = sub(h, '#define A6_GPU_ID\t\t640', '#define A6_GPU_ID\t\t618', 'gpu id')
 h = sub(h, '#define A6_CHIP_ID\t\t0x06040001ull', '#define A6_CHIP_ID\t\t0x06010800ull\t/* qcom,chipid */', 'chip id')
 h = sub(h, '#define A6_GPU_BASE\t\t0x02c00000ull', '#define A6_GPU_BASE\t\t0x05000000ull\t/* surya kgsl-3d0 */', 'gpu base')
