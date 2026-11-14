@@ -1,0 +1,26 @@
+diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
+index be0730f..e4a7437 100755
+--- a/bsd/dev/sweet_a6xx.c
++++ b/bsd/dev/sweet_a6xx.c
+@@ -91,9 +91,9 @@ static void zero_pa(uint64_t pa, uint64_t size)
+ #define TCR2_VAL	((7u << 15) | 2u)
+ 
+ #define GMU_SID		5
+-#define GMU_SID_MASK	0x400
++#define GMU_SID_MASK	0	/* surya: exact SID, as the DT (flame A640: 0x400) */
+ #define GPU_SID		0
+-#define GPU_SID_MASK	0x401
++#define GPU_SID_MASK	0	/* surya: exact SID 0 (gfx3d_user) (flame A640: 0x401) */
+ 
+ #define GMEM_L1(g)	a6_pool_pa(g, 0x0000)
+ #define GMEM_L2_0(g)	a6_pool_pa(g, 0x1000)
+@@ -259,6 +259,9 @@ static void smmu_bank(int smr, int cb, uint64_t ttbr0, uint32_t sid, uint32_t ma
+ 		wr32(S2CR(smr), (uint32_t)cb);
+ 		wr32(SMR(smr), (1u << 31) | (mask << 16) | sid);
+ 	}
++	if (smr >= 0)
++		a6_log("smmu: wrote smr%d %x s2cr %x; reads back smr %x s2cr %x\n", smr, (1u << 31) | (mask << 16) | sid,
++		    (uint32_t)cb, rd32(SMR(smr)), rd32(S2CR(smr)));
+ 	a6_log("smmu: smr%d %x -> cb%d cbar %x sctlr %x tcr %x tcr2 %x\n", smr, smr >= 0 ? rd32(SMR(smr)) : 0, cb,
+ 	       rd32(CBAR(cb)), rd32(c + CB_SCTLR), rd32(c + CB_TCR), rd32(c + CB_TCR2));
+ }

@@ -433,6 +433,17 @@ c = sub(c, '''	a6_log("gmu: hfi init %s (status %x)\\n", hrc ? "TIMEOUT" : "ok",
 		wr32(GMU_REG(GMU_SYSRESET), 1);
 	return hrc ? -1 : 0;''', 'hfi fail reset')
 
+# Stream IDs: surya's DT uses exact single SIDs (iommus <&kgsl_smmu 0x5> GMU kernel, <0x0> GPU user,
+# <0x2> secure) with no mask. flame's A640 masks (0x400 / 0x401) also claim SIDs 0x400.. that are not
+# ours here; the second test showed every SMR write dropped, consistent with the hypervisor refusing them.
+c = sub(c, '#define GMU_SID_MASK\t0x400', '#define GMU_SID_MASK\t0\t/* surya: exact SID, as the DT (flame A640: 0x400) */', 'gmu mask')
+c = sub(c, '#define GPU_SID_MASK\t0x401', '#define GPU_SID_MASK\t0\t/* surya: exact SID 0 (gfx3d_user) (flame A640: 0x401) */', 'gpu mask')
+c = sub(c, '''	a6_log("smmu: smr%d %x -> cb%d cbar %x sctlr %x tcr %x tcr2 %x\\n", smr, smr >= 0 ? rd32(SMR(smr)) : 0, cb,''',
+        '''	if (smr >= 0)
+		a6_log("smmu: wrote smr%d %x s2cr %x; reads back smr %x s2cr %x\\n", smr, (1u << 31) | (mask << 16) | sid,
+		    (uint32_t)cb, rd32(SMR(smr)), rd32(S2CR(smr)));
+	a6_log("smmu: smr%d %x -> cb%d cbar %x sctlr %x tcr %x tcr2 %x\\n", smr, smr >= 0 ? rd32(SMR(smr)) : 0, cb,''', 'smmu readback log')
+
 os.makedirs(out, exist_ok=True)
 open(os.path.join(out, 'sweet_a6xx.h'), 'w').write(h)
 open(os.path.join(out, 'sweet_a6xx.c'), 'w').write(c)
