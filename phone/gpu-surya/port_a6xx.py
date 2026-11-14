@@ -106,10 +106,13 @@ c = sub(c, '''	a6_log("gmu: init result %x %s, hfi_ctrl %x\\n", r, ok ? "BOOTED"
 	return ok ? 0 : -1;''', '''	a6_log("gmu: init result %x %s, hfi_ctrl %x\\n", r, ok ? "BOOTED" : "timeout", rd32(GMU_REG(GMU_HFI_CTRL)));
 	if (!ok)
 		return -1;
+	if (gmu_rail_on())
+		return -1;
 	wr32(GMU_REG(0x1f986), 1);				/* HFI_CTRL_INIT */
 	int hrc = wait_bit(GMU_REG(GMU_HFI_CTRL), 1, 1, 100);	/* HFI_CTRL_STATUS bit 0 */
 	a6_log("gmu: hfi init %s (status %x)\\n", hrc ? "TIMEOUT" : "ok", rd32(GMU_REG(GMU_HFI_CTRL)));
 	return hrc ? -1 : 0;''', 'hfi start')
+c = sub(c, 'static int gmu_boot(struct a6_gpu *g)\n{', 'static int gmu_rail_on(void);\n\nstatic int gmu_boot(struct a6_gpu *g)\n{', 'rail_on decl')
 
 # HFI v1 exchange: keep the reply's 4th word (FW_VER answers there)
 c = sub(c, '''				if ((hdr & 0xff) != 100 && (buf[1] >> 20) == seq)
@@ -157,7 +160,38 @@ static uint32_t aux16(uint64_t aux, uint32_t i)''', 'cmddb_addr')
 
 # HFI v1 start sequence (KGSL hfi_start for legacy firmware) and the a615-family OOB bits
 old_hfi = c[c.index('static int gmu_hfi(struct a6_gpu *g)'):c.index('/* ---- zap shader through TrustZone PAS ---- */')]
-new_hfi = '''static int gmu_hfi(struct a6_gpu *g)
+new_hfi = '''/*
+ * surya's GPU node has qcom,gpu-quirk-hfi-use-reg: KGSL a6xx_gmu_fw_start then votes the GX rail through
+ * registers right after the GMU boots (a6xx_gmu_gfx_rail_on: BOOT_SLUMBER_OPTION, GX/MX_VOTE_IDX and
+ * OOB boot_slumber = 6) and powers SPTPRAC, all before the HFI handshake.
+ */
+static int gmu_rail_on(void)
+{
+	uint32_t gx[5];
+	if (arc_votes(gx, gpu_lvl, 5, "gfx.lvl", "mx.lvl")) {
+		a6_log("rail: cmd-db levels not found\\n");
+		return -1;
+	}
+	wr32(GMU_REG(0x1cbf8), 0);			/* BOOT_SLUMBER_OPTION = OOB_BOOT_OPTION */
+	wr32(GMU_REG(0x1cbf9), gx[4] & 0xff);		/* GX_VOTE_IDX: gfx arc level (NOM) */
+	wr32(GMU_REG(0x1cbfa), (gx[4] >> 8) & 0xff);	/* MX_VOTE_IDX */
+	wr32(GMU_REG(GMU_H2G_SET), 1u << 22);		/* oob boot_slumber set: BIT(6 + 16) */
+	int ack = wait_bit(GMU_REG(GMU_G2H_INFO), 1u << 30, 1, 1000);
+	wr32(GMU_REG(GMU_G2H_CLR), 1u << 30);
+	a6_log("rail: gx vote %x, oob boot %s, pwr_clk_status %x, rpmh_state %x, gx gdsc %x\\n", gx[4],
+	    ack ? "TIMEOUT" : "acked", rd32(GMU_REG(0x1f8d0)), rd32(GMU_REG(GMU_RPMH_STATE)), rd32(GPUCC + GPUCC_GX_GDSCR));
+	if (ack) {
+		wr32(GMU_REG(GMU_H2G_SET), 1u << 30);	/* oob clear */
+		return -1;
+	}
+	/* a6xx_gmu_sptprac_enable */
+	wr32(GMU_REG(0x1a881), 0x00778000);		/* GX_SPTPRAC_POWER_CONTROL = POWERON */
+	int sp = wait_bit(GMU_REG(0x1f8d0), 1u << 3, 1, 10);
+	a6_log("rail: sptprac %s, pwr_clk_status %x\\n", sp ? "TIMEOUT" : "on", rd32(GMU_REG(0x1f8d0)));
+	return 0;
+}
+
+static int gmu_hfi(struct a6_gpu *g)
 {
 	static uint32_t msg[256];
 	uint32_t gx[5], cx[2];
@@ -223,6 +257,20 @@ new_hfi = '''static int gmu_hfi(struct a6_gpu *g)
 	}
 	rc = hfi_send(g, 3, msg, 160);
 	a6_log("hfi v1: BW_TBL (%u ddr cmds, cn0 %x) -> %d\\n", nd, cn0, rc);
+	/* HFI_USE_REG: H2F_MSG_TEST (5) ends the HFI exchange until the next boot */
+	memset(msg, 0, sizeof(msg));
+	rc = hfi_send(g, 5, msg, 1);
+	a6_log("hfi v1: TEST -> %d\\n", rc);
+	/* a6xx_gmu_dcvs_nohfi: perf level 4 (430 MHz) at least, bw level 0, OOB dcvs = 7 */
+	wr32(GMU_REG(0x1cbfc), 0);				/* DCVS_ACK_OPTION non-block */
+	wr32(GMU_REG(0x1cbfd), 4u | (3u << 28));		/* FREQ_VOTE(4, CLKSET_OPTION_ATLEAST) */
+	wr32(GMU_REG(0x1cbfe), 0);				/* BW_VOTE(0) */
+	wr32(GMU_REG(GMU_H2G_SET), 1u << 23);
+	int dack = wait_bit(GMU_REG(GMU_G2H_INFO), 1u << 31, 1, 1000);
+	wr32(GMU_REG(GMU_G2H_CLR), 1u << 31);
+	a6_log("dcvs: oob %s, return %x, pwr_clk_status %x\\n", dack ? "TIMEOUT" : "acked",
+	    rd32(GMU_REG(0x1cbff)), rd32(GMU_REG(0x1f8d0)));
+	wr32(GMU_REG(GMU_H2G_SET), 1u << 31);			/* oob clear */
 
 	/* OOB GPU (a630/a615 family): set BIT(16), ack BIT(24), clear BIT(24) */
 	wr32(GMU_REG(GMU_H2G_SET), 1u << 16);
