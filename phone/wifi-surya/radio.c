@@ -92,7 +92,9 @@ int smmu_wlan_identity(void)
 	uint64_t used[4] = { 0 };
 	int slot = -1, cb = -1;
 
-	printf("smmu: sCR0 %08x ID0 %08x ID1 %08x: %u SMRs, %u context banks, page %#x x %u\n", rd32(s), id0, id1, nsmr,
+	/* surya: never read sCR0/sCR1 (s + 0, s + 4): on SM7150 that access hangs the CPU (the hypervisor's
+	 * SMMU), while ID0/ID1, the SMR/S2CR tables and the context banks work (sweet_usb.c uses them). */
+	printf("smmu: ID0 %08x ID1 %08x: %u SMRs, %u context banks, page %#x x %u\n", id0, id1, nsmr,
 	       ncb, psize, npage);
 	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
 		uint32_t smr = rd32(s + 0x800 + 4 * i), s2cr = rd32(s + 0xc00 + 4 * i);
