@@ -1,0 +1,46 @@
+diff --git a/bsd/dev/sweet_pmem.c b/bsd/dev/sweet_pmem.c
+index b1f0be3..3d9bee7 100644
+--- a/bsd/dev/sweet_pmem.c
++++ b/bsd/dev/sweet_pmem.c
+@@ -149,6 +149,26 @@ pm_io(uint64_t pa)
+ 	return pm_map[i].va ? (volatile uint32_t *)(pm_map[i].va + (pa - win)) : NULL;
+ }
+ 
++/*
++ * surya: one plain LDR/STR per word, no writeback, no pairs. On SM7150 the hypervisor emulates EL1
++ * accesses to the apps SMMU; it can only do so when the abort syndrome is valid (ISV=1), which
++ * post-indexed, paired or vector accesses (what the compiler made of the copy loops) do not give:
++ * those reads never returned. sweet_poke.c and sweet_usb.c always did single plain loads.
++ */
++static inline uint32_t
++pm_ldr32(volatile uint32_t *p)
++{
++	uint32_t v;
++	__asm__ volatile ("ldr %w0, [%1]" : "=r"(v) : "r"(p) : "memory");
++	return v;
++}
++
++static inline void
++pm_str32(volatile uint32_t *p, uint32_t v)
++{
++	__asm__ volatile ("str %w0, [%1]" : : "r"(v), "r"(p) : "memory");
++}
++
+ static int
+ pm_rw(struct uio *uio, bool write)
+ {
+@@ -178,12 +198,12 @@ pm_rw(struct uio *uio, bool write)
+ 			err = uiomove((caddr_t)pm_bounce, (int)n, uio);
+ 			__asm__ volatile ("dmb oshst" ::: "memory");
+ 			for (unsigned i = 0; !err && i < n / 4; i++) {
+-				r[i] = pm_bounce[i];
++				pm_str32(r + i, pm_bounce[i]);
+ 			}
+ 			__asm__ volatile ("dsb osh" ::: "memory");
+ 		} else {
+ 			for (unsigned i = 0; i < n / 4; i++) {
+-				pm_bounce[i] = r[i];
++				pm_bounce[i] = pm_ldr32(r + i);
+ 			}
+ 			__asm__ volatile ("dmb oshld" ::: "memory");
+ 			err = uiomove((caddr_t)pm_bounce, (int)n, uio);
