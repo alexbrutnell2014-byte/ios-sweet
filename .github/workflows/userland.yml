@@ -20,8 +20,12 @@ jobs:
           xcrun -sdk iphoneos --show-sdk-version
       - name: wland (surya)
         run: sh phone/wifi-surya/build.sh
+      - name: tools (surya)
+        run: sh phone/tools-surya/build.sh
       - uses: actions/upload-artifact@v4
         with:
           name: userland
-          path: phone/wifi-surya/out/
+          path: |
+            phone/wifi-surya/out/
+            phone/tools-surya/out/
           retention-days: 30
