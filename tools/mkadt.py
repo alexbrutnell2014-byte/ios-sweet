@@ -129,6 +129,13 @@ def build(seed=None, qemu=False, highmem=False, nvt_fw=None, gpu_fw=None):
         ('effective-production-status-ap', u32(0)),
         ('certificate-security-mode', u32(1)),
         ('effective-security-mode-sep', u32(1)),
+        # MobileGestalt's WiFi/Bluetooth/Ethernet addresses (from ios-flame): without them each WifiAddress
+        # answer waits 5 s for an IONetworkController that never comes; installd then takes 5 s per bundle,
+        # LaunchServices never finishes registering extensions, and PosterBoard has no poster providers: no
+        # wallpaper, widgets stay "Waiting...". Locally administered; wifi0 = what wland gives WLFW (radio.c).
+        ('mac-address-wifi0', bytes([0x02, 0x50, 0x49, 0x58, 0x45, 0x4c])),
+        ('mac-address-bluetooth0', bytes([0x02, 0x50, 0x49, 0x58, 0x45, 0x4d])),
+        ('mac-address-ethernet0', bytes([0x02, 0x50, 0x49, 0x58, 0x45, 0x4e])),
     ] + gpufw, [node('memory-map', [ph()]),
         # Local boot policy (kern_csr.c): SIP relaxed like `csrutil disable`
         # (lp-sip0: untrusted kexts, unrestricted FS, task_for_pid, kernel
