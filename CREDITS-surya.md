@@ -33,3 +33,12 @@ SOFTWARE.
 
 Phone userland: phone/wifi-surya is a port of ios-flame phone/wifi (MIT, notice above): surya modem
 region, MSA region, WLAN SMMU stream, WLAN rails and board-data selection.
+
+## Metal (GPU) stack
+
+- `phone/metal2/` and `phone/turnip/` are ios-flame's (MIT): SweetMetal2.bundle (UniXNU's NativeBridge Metal
+  frontend, patched for iOS 16), the native Metal bridge (UniXNU, MIT) with its metal2vulkan patches, Turnip phone
+  tests and NativeAdrenoABI.h (UniXNU). `tools/build-metal-ios.sh` follows flame's build scripts.
+- Fetched at build time, never copied: Mesa (<https://gitlab.freedesktop.org/mesa/mesa>, MIT) at 85fda3b3 with
+  UniXNU's patches/mesa at 6c56ece (<https://github.com/UniXNU/UniXNU>), and metal2vulkan
+  (<https://github.com/steelbrain/metal2vulkan>, GPL-2.0+ OR LGPL-3.0+) at 720ef1ce.
