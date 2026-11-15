@@ -7,6 +7,8 @@
  *                           (IPCRTR + apr_audio_svc), QRTR + pd-mapper, then APR: the core service's
  *                           state until it says the audio services are up, and their versions; then
  *                           stays SECS seconds (default 20; 0 = until killed) serving the link
+ *   adspd tone [T] [SECS]   boot, then stage 2: the speakers' MI2S port, a stream through ADM/ASM and a
+ *                           1 kHz tone at -20 dBFS for T seconds (default 3); the amplifiers stay off
  *   adspd stop              asks the ADSP to stop (SMP2P), then TrustZone shuts it down
  *
  * Numbers (the phone's own device tree, /root/surya/live.dts):
@@ -963,6 +965,8 @@ struct apr_hdr {
 } __attribute__((packed));
 
 static struct { int got; uint32_t opcode, token, len; uint32_t w[256]; } apr_ans;
+static volatile sig_atomic_t quit;
+static int apr_event(const struct apr_hdr *h, const uint32_t *w, uint32_t len);	/* the stream's events (tone) */
 
 static void apr_rx(const uint8_t *d, uint32_t n)
 {
@@ -971,6 +975,12 @@ static void apr_rx(const uint8_t *d, uint32_t n)
 		return;
 	memcpy(&h, d, sizeof(h));
 	uint32_t hl = ((h.hdr_field >> 4) & 0xf) * 4, len = n > hl ? n - hl : 0;
+	{
+		uint32_t ev[8] = { 0 };
+		memcpy(ev, d + hl, len < sizeof(ev) ? len : sizeof(ev));
+		if (apr_event(&h, ev, len))
+			return;
+	}
 	apr_ans.opcode = h.opcode;
 	apr_ans.token = h.token;
 	apr_ans.len = len;
@@ -981,24 +991,484 @@ static void apr_rx(const uint8_t *d, uint32_t n)
 	    h.src_port, h.opcode, h.token, len, apr_ans.w[0], apr_ans.w[1], apr_ans.w[2]);
 }
 
-static int apr_ask(uint8_t svc, uint32_t opcode, const void *payload, uint32_t plen, unsigned wait_ms)
+/* One APR packet to service `svc', port `port' (ours is the same port: the answer comes back to it). */
+static int apr_send(uint8_t svc, uint16_t port, uint32_t token, uint32_t opcode, const void *payload, uint32_t plen)
 {
-	static uint32_t token = 1;
 	uint8_t b[512];
-	struct apr_hdr h = { APR_HDR_FIELD, (uint16_t)(sizeof(h) + plen), APR_SVC_CORE, APR_DOMAIN_APPS, 0,
-			     svc, APR_DOMAIN_ADSP, 0, token++, opcode };
+	struct apr_hdr h = { APR_HDR_FIELD, (uint16_t)(sizeof(h) + plen), svc, APR_DOMAIN_APPS, port,
+			     svc, APR_DOMAIN_ADSP, port, token, opcode };
 	if (sizeof(h) + plen > sizeof(b))
 		return -1;
 	memcpy(b, &h, sizeof(h));
 	if (plen)
 		memcpy(b + sizeof(h), payload, plen);
+	return ch_send(&chans[1], b, sizeof(h) + plen);
+}
+
+static int apr_ask_port(uint8_t svc, uint16_t port, uint32_t opcode, const void *payload, uint32_t plen, unsigned wait_ms)
+{
+	static uint32_t token = 1;
 	apr_ans.got = 0;
-	if (ch_send(&chans[1], b, sizeof(h) + plen))
+	if (apr_send(svc, port, token++ & 0x7fffffffu, opcode, payload, plen))
 		return -1;
 	uint64_t end = now_ms() + wait_ms;
 	while (now_ms() < end && !apr_ans.got)
 		poll_for(1);
 	return apr_ans.got ? 0 : -1;
+}
+
+static int apr_ask(uint8_t svc, uint32_t opcode, const void *payload, uint32_t plen, unsigned wait_ms)
+{
+	return apr_ask_port(svc, 0, opcode, payload, plen, wait_ms);
+}
+
+/* ---- stage 2: the speakers' path, with a test tone (the amplifiers stay off) ----
+ *
+ * Linux sound/soc/qcom/qdsp6 (q6afe.c, q6adm.c, q6asm.c) and HackiOS drivers/audio/hakios.sound.c (APSL 2.0),
+ * with surya's numbers (live.dts, the stock kernel's dmesg):
+ *   - the two TAS2562 amplifiers sit on the TERTIARY MI2S: sm6150-asoc-snd, qcom,msm-mi2s-master (the SoC
+ *     makes the clocks), msm-dai-q6-mi2s-tert rx-lines 1 (SD0 out), tx-lines 2 (SD1: their I/V sense back);
+ *     pins ter_mi2s_*_active: GPIO 53 sck, 54 ws, 55 sd0, 56 sd1, function ter_mi2s (1 on all four,
+ *     pinctrl-sm7150.c), 8 mA, no pull; TLMM WEST tile 0x03500000
+ *   - AFE port 0x1004 (TERTIARY_MI2S_RX), bit clock LPASS clock 0x104 (TER_MI2S_IBIT, attribute couple-no):
+ *     16 bits x 2 channels x 48 kHz = 1.536 MHz
+ *   - qcom,msm-audio-ion: iommus <&apps_smmu 0x1b21 0>, qcom,smmu-sid-mask 0xf: the DSP takes the low four
+ *     bits of the stream from bits 32..35 of the addresses it is given. Here the stream gets an apps SMMU
+ *     bank with translation off (as wland's WLAN stream), so those addresses are physical | 1 << 32.
+ *   - our buffer: 0xe1000000, RAM below 4 GB that XNU does not manage (between wland's radio pool, which
+ *     ends at 0xe1000000, and its rmtfs at 0xe1100000); /dev/pmem maps it uncached: no cache maintenance
+ *   - ADM device open v5 to the port (no processing), ASM session 1 stream 1 writing 16-bit PCM, routed to it.
+ */
+#define APR_SVC_AFE		4
+#define APR_SVC_ASM		7
+#define APR_SVC_ADM		8
+
+#define TLMM_WEST		0x03500000ull
+#define GPIO_CFG(n)		(TLMM_WEST + 0x1000ull * (n))
+#define GPIO_IO(n)		(TLMM_WEST + 0x1000ull * (n) + 4)
+#define CFG_FUNC1		(1u << 2)
+#define CFG_8MA			(3u << 6)
+#define CFG_OE			(1u << 9)
+
+#define SMMU_PA			0x15000000ull
+#define SMMU_SIZE		0x00100000u
+#define AUDIO_SID		0x1b21
+#define CB_CBAR			0x0001f000u	/* as wland: S1 context, S2 bypass */
+#define CB_CBA2R		0x00000001u
+#define CB_SCTLR		0x000000e0u	/* M = 0: no translation */
+
+#define BUF_PA			0xe1000000ull
+#define DSP_ADDR(pa)		((pa) | (1ull << 32))	/* the stream's low bits (0x1b21 & 0xf) */
+#define PERIODS			8
+#define PERIOD_FRAMES		960		/* 20 ms */
+#define PERIOD_BYTES		(PERIOD_FRAMES * 4)
+#define BUF_BYTES		(PERIODS * 4096)
+
+#define AFE_PORT		0x1004		/* TERTIARY_MI2S_RX */
+#define CLK_TER_MI2S_IBIT	0x104
+#define CLK_ATTR_COUPLE_NO	1
+#define RATE			48000
+#define BITS			16
+
+#define AFE_PORT_CMD_DEVICE_START	0x000100e5u
+#define AFE_PORT_CMD_DEVICE_STOP	0x000100e6u
+#define AFE_PORT_CMD_SET_PARAM_V2	0x000100efu
+#define AFE_SVC_CMD_SET_PARAM		0x000100f3u
+#define AFE_MODULE_AUDIO_DEV_INTERFACE	0x0001020cu
+#define AFE_PARAM_ID_I2S_CONFIG		0x0001020du
+#define AFE_MODULE_CLOCK_SET		0x0001028fu
+#define AFE_PARAM_ID_CLOCK_SET		0x00010290u
+
+#define ADM_CMD_DEVICE_OPEN_V5		0x00010326u
+#define ADM_CMDRSP_DEVICE_OPEN_V5	0x00010329u
+#define ADM_CMD_DEVICE_CLOSE_V5		0x00010327u
+#define ADM_CMD_MATRIX_MAP_ROUTINGS_V5	0x00010325u
+#define ADM_TOPOLOGY_NONE		0x00010312u
+
+#define ASM_CMD_SHARED_MEM_MAP_REGIONS	0x00010d92u
+#define ASM_CMDRSP_SHARED_MEM_MAP_REGIONS 0x00010d93u
+#define ASM_CMD_SHARED_MEM_UNMAP_REGIONS 0x00010d94u
+#define ASM_STREAM_CMD_OPEN_WRITE_V3	0x00010db3u
+#define ASM_DATA_CMD_MEDIA_FMT_UPDATE_V2 0x00010d98u
+#define ASM_SESSION_CMD_RUN_V2		0x00010daau
+#define ASM_DATA_CMD_WRITE_V2		0x00010dabu
+#define ASM_DATA_EVENT_WRITE_DONE_V2	0x00010d99u
+#define ASM_SESSION_EVENT_RX_UNDERFLOW	0x00010c17u
+#define ASM_STREAM_CMD_CLOSE		0x00010bcdu
+#define ASM_TOPOLOGY_NONE		0x00010c68u
+#define ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2 0x00010da5u
+#define ASM_SHMEM_4K_POOL		3
+#define STREAM_PORT			((1u << 8) | 1)	/* session 1, stream 1 */
+#define WRITE_TOKEN			0x80000000u
+
+static const char *dsp_error(uint32_t s)
+{
+	static const char *const n[] = { "ok", "failed", "bad parameter", "unsupported", "version", "unexpected",
+		"panic", "no resource", "bad handle", "already", "not ready", "pending", "busy", "aborted", "preempted",
+		"continue", "immediate", "not implemented", "need more", "no memory", "not there" };
+	return s < sizeof(n) / sizeof(n[0]) ? n[s] : "?";
+}
+
+static uint32_t returned, written_done, write_errors, underflows;
+
+static int apr_event(const struct apr_hdr *h, const uint32_t *w, uint32_t len)
+{
+	if (h->src_svc != APR_SVC_ASM)
+		return 0;
+	if (h->opcode == ASM_DATA_EVENT_WRITE_DONE_V2 && (h->token & WRITE_TOKEN)) {
+		if (len >= 16 && w[3])
+			write_errors++;
+		written_done++;
+		returned |= 1u << (h->token & 31);
+		return 1;
+	}
+	if (h->opcode == APR_BASIC_RSP && (h->token & WRITE_TOKEN)) {
+		write_errors++;
+		written_done++;
+		returned |= 1u << (h->token & 31);
+		if (write_errors <= 3)
+			LOG("tone: write %u refused: %s", h->token & 31, dsp_error(w[1]));
+		return 1;
+	}
+	if (h->opcode == ASM_SESSION_EVENT_RX_UNDERFLOW) {
+		underflows++;
+		return 1;
+	}
+	return 0;
+}
+
+/* A command answered with the basic response (0 when status 0), or with opcode `want' (then in apr_ans). */
+static int cmd(const char *what, uint8_t svc, uint16_t port, uint32_t opcode, const void *p, uint32_t len, uint32_t want)
+{
+	if (apr_ask_port(svc, port, opcode, p, len, 1500)) {
+		LOG("tone: %s: NO ANSWER", what);
+		return -1;
+	}
+	if (apr_ans.opcode == APR_BASIC_RSP && apr_ans.w[0] == opcode) {
+		LOG("tone: %s: %s%s", what, apr_ans.w[1] ? "REFUSED: " : "done", apr_ans.w[1] ? dsp_error(apr_ans.w[1]) : "");
+		return apr_ans.w[1] == 0 && !want ? 0 : -1;
+	}
+	if (want && apr_ans.opcode == want)
+		return 0;
+	LOG("tone: %s: unexpected answer %#x: %08x %08x", what, apr_ans.opcode, apr_ans.w[0], apr_ans.w[1]);
+	return -1;
+}
+
+struct afe_param { uint32_t module, param; uint16_t size, reserved; } __attribute__((packed));
+
+static int afe_svc_param(const char *what, uint32_t module, uint32_t param, const void *data, uint16_t size)
+{
+	uint8_t pkt[16 + sizeof(struct afe_param) + 64] = { 0 };
+	struct afe_param ph = { module, param, size, 0 };
+	*(uint32_t *)pkt = (uint32_t)sizeof(ph) + size;		/* in band: address 0, handle 0 */
+	memcpy(pkt + 16, &ph, sizeof(ph));
+	memcpy(pkt + 16 + sizeof(ph), data, size);
+	return cmd(what, APR_SVC_AFE, 0, AFE_SVC_CMD_SET_PARAM, pkt, 16 + (uint32_t)sizeof(ph) + size, 0);
+}
+
+static int afe_port_param(const char *what, uint32_t module, uint32_t param, const void *data, uint16_t size)
+{
+	uint8_t pkt[16 + sizeof(struct afe_param) + 64] = { 0 };
+	struct afe_param ph = { module, param, size, 0 };
+	*(uint16_t *)pkt = AFE_PORT;
+	*(uint16_t *)(pkt + 2) = (uint16_t)(sizeof(ph) + size);
+	memcpy(pkt + 16, &ph, sizeof(ph));
+	memcpy(pkt + 16 + sizeof(ph), data, size);
+	return cmd(what, APR_SVC_AFE, 0, AFE_PORT_CMD_SET_PARAM_V2, pkt, 16 + (uint32_t)sizeof(ph) + size, 0);
+}
+
+static int afe_clock(int on)
+{
+	struct { uint32_t version, id, hz; uint16_t attr, root; uint32_t enable; } __attribute__((packed)) c =
+		{ 1, CLK_TER_MI2S_IBIT, RATE * BITS * 2, CLK_ATTR_COUPLE_NO, 0, (uint32_t)on };
+	return afe_svc_param(on ? "bit clock 0x104 at 1.536 MHz, on" : "bit clock, off", AFE_MODULE_CLOCK_SET,
+			     AFE_PARAM_ID_CLOCK_SET, &c, sizeof(c));
+}
+
+/* the pins */
+static const unsigned pins[4] = { 53, 54, 55, 56 };
+static const uint32_t pin_cfg[4] = { CFG_FUNC1 | CFG_8MA | CFG_OE, CFG_FUNC1 | CFG_8MA | CFG_OE, CFG_FUNC1 | CFG_8MA | CFG_OE,
+				     CFG_FUNC1 | CFG_8MA };
+static uint32_t pin_old_cfg[4], pin_old_io[4];
+static int pins_taken;
+
+static void pins_on(void)
+{
+	for (int i = 0; i < 4; i++) {
+		pin_old_cfg[i] = rd32(GPIO_CFG(pins[i]));
+		pin_old_io[i] = rd32(GPIO_IO(pins[i]));
+	}
+	pins_taken = 1;
+	for (int i = 0; i < 4; i++) {
+		wr32(GPIO_IO(pins[i]), (pin_cfg[i] & CFG_OE) ? 2 : 0);
+		wr32(GPIO_CFG(pins[i]), pin_cfg[i]);
+	}
+	LOG("tone: pins 53-56 -> ter_mi2s (were cfg %#x %#x %#x %#x)", pin_old_cfg[0], pin_old_cfg[1], pin_old_cfg[2],
+	    pin_old_cfg[3]);
+}
+
+static void pins_off(void)
+{
+	if (!pins_taken)
+		return;
+	for (int i = 0; i < 4; i++) {
+		wr32(GPIO_CFG(pins[i]), pin_old_cfg[i]);
+		wr32(GPIO_IO(pins[i]), pin_old_io[i] & 2);
+	}
+	pins_taken = 0;
+}
+
+static void pin_activity(unsigned pin, const char *name)
+{
+	uint32_t last = rd32(GPIO_IO(pin)) & 1, changes = 0, ones = 0, reads = 20000;
+	for (uint32_t i = 0; i < reads; i++) {
+		uint32_t v = rd32(GPIO_IO(pin)) & 1;
+		changes += v != last;
+		ones += v;
+		last = v;
+	}
+	LOG("tone: gpio%u (%s): %u changes, %u ones in %u reads", pin, name, changes, ones, reads);
+}
+
+/* the stream's SMMU bank (translation off), as wland's smmu_wlan_identity */
+static int smmu_slot = -1, smmu_cb = -1;
+static uint32_t smmu_psize, smmu_npage;
+
+static int smmu_audio_identity(void)
+{
+	uint64_t s = SMMU_PA;
+	uint32_t id0 = rd32(s + 0x20), id1 = rd32(s + 0x24), nsmr = id0 & 0xff, ncb = id1 & 0xff;
+	uint64_t used[4] = { 0 };
+	smmu_psize = (id1 >> 31) ? 0x10000 : 0x1000;
+	smmu_npage = 1u << (((id1 >> 28) & 7) + 1);
+	/* never read sCR0/sCR1 on SM7150 (wland radio.c): the access hangs the CPU */
+	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
+		uint32_t smr = rd32(s + 0x800 + 4 * i), s2cr = rd32(s + 0xc00 + 4 * i);
+		if (!(smr >> 31)) {
+			if (smmu_slot < 0)
+				smmu_slot = (int)i;
+			continue;
+		}
+		if (((s2cr >> 16) & 3) == 0)
+			used[(s2cr & 0xff) / 64] |= 1ull << ((s2cr & 0xff) % 64);
+		uint32_t id = smr & 0x7fff, m = (smr >> 16) & 0x7fff;
+		if (((id ^ AUDIO_SID) & ~m & 0x7fff) == 0) {
+			LOG("tone: smmu: SMR%u %08x already matches %#x (S2CR %08x): left as it is", i, smr, AUDIO_SID, s2cr);
+			smmu_slot = -1;
+			return ((s2cr >> 16) & 3) == 1 ? 0 : -1;
+		}
+	}
+	for (uint32_t c = 0; c < ncb && c < 256; c++) {
+		uint64_t cbp = s + (uint64_t)smmu_npage * smmu_psize + (uint64_t)c * smmu_psize;
+		if (!(used[c / 64] & (1ull << (c % 64))) && !(rd32(cbp) & 1) && rd32(s + smmu_psize + 4 * c) == 0) {
+			smmu_cb = (int)c;
+			break;
+		}
+	}
+	if (smmu_slot < 0 || smmu_cb < 0 || (uint64_t)(smmu_npage + smmu_cb + 1) * smmu_psize > SMMU_SIZE) {
+		LOG("tone: smmu: no free SMR/bank (SMR %d, bank %d)", smmu_slot, smmu_cb);
+		smmu_slot = -1;
+		return -1;
+	}
+	uint64_t gr1 = s + smmu_psize, cbp = s + (uint64_t)smmu_npage * smmu_psize + (uint64_t)smmu_cb * smmu_psize;
+	wr32(cbp + 0x58, 0xffffffff);
+	wr32(cbp + 0x20, 0);
+	wr32(cbp + 0x24, 0);
+	wr32(cbp + 0x30, 0);
+	wr32(cbp + 0x10, 0);
+	wr32(cbp + 0x38, 0);
+	wr32(cbp + 0x3c, 0);
+	wr32(gr1 + 0x800 + 4 * smmu_cb, CB_CBA2R);
+	wr32(gr1 + 4 * smmu_cb, CB_CBAR);
+	wr32(cbp, CB_SCTLR);
+	wr32(s + 0xc00 + 4 * smmu_slot, (uint32_t)smmu_cb);
+	wr32(s + 0x800 + 4 * smmu_slot, (1u << 31) | AUDIO_SID);
+	wr32(s + 0x70, 0);
+	for (int i = 0; i < 1000 && (rd32(s + 0x74) & 1); i++)
+		delay_ms(1);
+	uint32_t smr = rd32(s + 0x800 + 4 * smmu_slot), s2cr = rd32(s + 0xc00 + 4 * smmu_slot);
+	int ok = smr == ((1u << 31) | AUDIO_SID) && (s2cr & 0x300ff) == (uint32_t)smmu_cb;
+	LOG("tone: smmu: stream %#x -> CB%d via SMR%d (translation off): SMR %08x S2CR %08x -> %s", AUDIO_SID, smmu_cb,
+	    smmu_slot, smr, s2cr, ok ? "ok" : "NOT as written");
+	return ok ? 0 : -1;
+}
+
+static void smmu_audio_report_and_off(void)
+{
+	if (smmu_slot < 0)
+		return;
+	uint64_t s = SMMU_PA, cbp = s + (uint64_t)smmu_npage * smmu_psize + (uint64_t)smmu_cb * smmu_psize;
+	uint32_t fsr = rd32(cbp + 0x58);
+	LOG("tone: smmu: CB%d FSR %#x%s", smmu_cb, fsr, fsr ? " (FAULTS: the DSP was refused)" : " (no faults)");
+	wr32(s + 0x800 + 4 * smmu_slot, 0);
+	wr32(s + 0xc00 + 4 * smmu_slot, 0x20000);	/* fault, as an unused entry */
+	wr32(s + smmu_psize + 4 * smmu_cb, 0);
+	smmu_slot = -1;
+}
+
+/* 1 kHz at 48 kHz, -20 dBFS: one cycle */
+static const int16_t tone_cycle[48] = {
+	0, 428, 848, 1254, 1638, 1995, 2317, 2600, 2838, 3028, 3165, 3249,
+	3277, 3249, 3165, 3028, 2838, 2600, 2317, 1995, 1638, 1254, 848, 428,
+	0, -428, -848, -1254, -1638, -1995, -2317, -2600, -2838, -3028, -3165, -3249,
+	-3277, -3249, -3165, -3028, -2838, -2600, -2317, -1995, -1638, -1254, -848, -428,
+};
+static uint32_t tone_at, map_handle;
+
+static void period_fill(unsigned p)
+{
+	int16_t s[PERIOD_FRAMES * 2];
+	for (unsigned f = 0; f < PERIOD_FRAMES; f++)
+		s[2 * f] = s[2 * f + 1] = tone_cycle[tone_at++ % 48];
+	pm_wr(BUF_PA + 4096ull * p, s, sizeof(s));
+}
+
+static int period_write(unsigned p)
+{
+	uint64_t a = DSP_ADDR(BUF_PA + 4096ull * p);
+	uint32_t w[8] = { (uint32_t)a, (uint32_t)(a >> 32), map_handle, PERIOD_BYTES, p, 0, 0, 0 };
+	return apr_send(APR_SVC_ASM, STREAM_PORT, WRITE_TOKEN | p, ASM_DATA_CMD_WRITE_V2, w, sizeof(w));
+}
+
+static int tone(unsigned secs)
+{
+	int ok = 0, clock_on = 0, port_on = 0, mapped = 0, copp_open = 0, stream_open = 0;
+	uint32_t copp = 0;
+	uint16_t start[2] = { AFE_PORT, 0 };
+
+	if (secs > 10)
+		secs = 10;
+	pins_on();
+	if (smmu_audio_identity())
+		goto out;
+	/* the port */
+	clock_on = afe_clock(1) == 0;
+	if (!clock_on)
+		goto out;
+	{
+		struct { uint32_t version; uint16_t bits, lines, stereo, ws_src; uint32_t rate; uint16_t format, reserved; }
+			__attribute__((packed)) i2s = { 1, BITS, 1 /* SD0 */, 1 /* stereo */, 1 /* internal */, RATE, 0, 0 };
+		if (afe_port_param("port 0x1004: I2S SD0, stereo, 16 bits, 48 kHz, master", AFE_MODULE_AUDIO_DEV_INTERFACE,
+				   AFE_PARAM_ID_I2S_CONFIG, &i2s, sizeof(i2s)))
+			goto out;
+	}
+	port_on = cmd("port 0x1004, start", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_START, start, sizeof(start), 0) == 0;
+	if (!port_on)
+		goto out;
+	pin_activity(53, "bit clock");
+	pin_activity(54, "word select");
+	/* the stream */
+	{
+		uint64_t a = DSP_ADDR(BUF_PA);
+		struct { uint16_t pool, regions; uint32_t property, lo, hi, size; } __attribute__((packed)) map =
+			{ ASM_SHMEM_4K_POOL, 1, 0, (uint32_t)a, (uint32_t)(a >> 32), BUF_BYTES };
+		uint8_t zero[4096] = { 0 };
+		for (unsigned p = 0; p < PERIODS; p++)
+			pm_wr(BUF_PA + 4096ull * p, zero, sizeof(zero));
+		if (cmd("our periods, mapped for the DSP", APR_SVC_ASM, 0, ASM_CMD_SHARED_MEM_MAP_REGIONS, &map, sizeof(map),
+			ASM_CMDRSP_SHARED_MEM_MAP_REGIONS))
+			goto out;
+		mapped = 1;
+		map_handle = apr_ans.w[0];
+		LOG("tone: %u KB at %#llx are the DSP's handle %#x", BUF_BYTES / 1024, (unsigned long long)a, map_handle);
+	}
+	{
+		struct { uint16_t flags, mode, ep1, ep2; uint32_t topology; uint16_t channels, bits; uint32_t rate; uint8_t map[8]; }
+			__attribute__((packed)) open = { 0, 1 /* playback */, AFE_PORT, 0xffff, ADM_TOPOLOGY_NONE, 2, BITS, RATE,
+							 { 1, 2 } };
+		if (cmd("device path to the port (ADM)", APR_SVC_ADM, AFE_PORT, ADM_CMD_DEVICE_OPEN_V5, &open, sizeof(open),
+			ADM_CMDRSP_DEVICE_OPEN_V5))
+			goto out;
+		if (apr_ans.w[0]) {
+			LOG("tone: device path REFUSED: %s", dsp_error(apr_ans.w[0]));
+			goto out;
+		}
+		copp = apr_ans.w[1] & 0xffff;
+		copp_open = 1;
+		LOG("tone: device path open: COPP %u", copp);
+	}
+	{
+		struct { uint32_t flags; uint16_t sink, bits; uint32_t topology, format; } __attribute__((packed)) w =
+			{ 0, 0, BITS, ASM_TOPOLOGY_NONE, ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2 };
+		if (cmd("stream 1, opened for writing", APR_SVC_ASM, STREAM_PORT, ASM_STREAM_CMD_OPEN_WRITE_V3, &w, sizeof(w), 0))
+			goto out;
+		stream_open = 1;
+	}
+	{
+		struct { uint32_t matrix, sessions; uint16_t session, copps; uint16_t copp[2]; } __attribute__((packed)) r =
+			{ 0, 1, 1, 1, { (uint16_t)copp, 0 } };
+		struct { uint32_t size; uint16_t channels, bits; uint32_t rate; uint16_t is_signed, reserved; uint8_t map[8]; }
+			__attribute__((packed)) f = { 20, 2, BITS, RATE, 1, 0, { 1, 2 } };
+		uint32_t run[3] = { 0, 0, 0 };
+		if (cmd("session 1 routed to the device path", APR_SVC_ADM, 0, ADM_CMD_MATRIX_MAP_ROUTINGS_V5, &r, sizeof(r), 0) ||
+		    cmd("stream format: 2 x 16 bits, 48 kHz", APR_SVC_ASM, STREAM_PORT, ASM_DATA_CMD_MEDIA_FMT_UPDATE_V2, &f,
+			sizeof(f), 0) ||
+		    cmd("session, run", APR_SVC_ASM, STREAM_PORT, ASM_SESSION_CMD_RUN_V2, run, sizeof(run), 0))
+			goto out;
+	}
+	/* the tone: periods written as the DSP gives them back */
+	{
+		uint32_t sent = 0, done0 = written_done;
+		int over = 0;
+		returned = 0;
+		tone_at = 0;
+		uint64_t began = now_ms();
+		for (unsigned p = 0; p < PERIODS; p++) {
+			period_fill(p);
+			if (period_write(p))
+				goto out;
+			sent++;
+		}
+		for (;;) {
+			poll_for(2);
+			uint32_t back = returned;
+			uint64_t now = now_ms();
+			returned &= ~back;
+			for (unsigned p = 0; p < PERIODS && !over; p++) {
+				if (!(back & (1u << p)))
+					continue;
+				period_fill(p);
+				if (period_write(p)) {
+					over = 1;
+					break;
+				}
+				sent++;
+			}
+			if (!over && (now - began >= secs * 1000ull || quit))
+				over = 1;
+			if (over && written_done - done0 >= sent)
+				break;
+			if (written_done == done0 && now - began > 1000) {
+				LOG("tone: THE DSP HAS GIVEN NO PERIOD BACK IN A SECOND");
+				break;
+			}
+			if (now - began > secs * 1000ull + 2000) {
+				LOG("tone: not every period came back 2 s after the end (%u of %u)", written_done - done0, sent);
+				break;
+			}
+		}
+		uint64_t ms = now_ms() - began;
+		uint32_t done = written_done - done0;
+		LOG("tone: %u periods written, %u given back (%u with an error), %u underflows, in %llu ms: %llu frames/s",
+		    sent, done, write_errors, underflows, (unsigned long long)ms,
+		    ms ? (unsigned long long)done * PERIOD_FRAMES * 1000 / ms : 0);
+		ok = done > PERIODS && !write_errors;
+	}
+out:
+	if (stream_open)
+		cmd("stream, closed", APR_SVC_ASM, STREAM_PORT, ASM_STREAM_CMD_CLOSE, NULL, 0, 0);
+	if (copp_open)
+		cmd("device path, closed", APR_SVC_ADM, (uint16_t)copp, ADM_CMD_DEVICE_CLOSE_V5, NULL, 0, 0);
+	if (mapped)
+		cmd("periods, unmapped", APR_SVC_ASM, 0, ASM_CMD_SHARED_MEM_UNMAP_REGIONS, &map_handle, sizeof(map_handle), 0);
+	if (port_on)
+		cmd("port 0x1004, stop", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_STOP, start, sizeof(start), 0);
+	if (clock_on)
+		afe_clock(0);
+	smmu_audio_report_and_off();
+	pins_off();
+	LOG("tone: %s", ok ? "THE DSP PLAYED THE TONE TO THE SPEAKER PORT (amplifiers off: silent)" : "FAILED");
+	return ok ? 0 : 3;
 }
 
 /* ---- the steps ---- */
@@ -1019,11 +1489,13 @@ static int status(void)
 	return 0;
 }
 
-static volatile sig_atomic_t quit;
 static void on_sig(int s) { (void)s; quit = 1; }
 
-static int boot(unsigned secs, int force)
+static int boot(unsigned secs, int force, unsigned tone_secs)
 {
+	int tone_rc = 0;
+	signal(SIGTERM, on_sig);
+	signal(SIGINT, on_sig);
 	uint64_t pa;
 	uint32_t sz;
 	if (smem_get(HOST_ADSP, SMP2P_IN, &pa, &sz) == 0 && !force) {
@@ -1068,13 +1540,13 @@ static int boot(unsigned secs, int force)
 				printf("  service %#x version %#x\n", apr_ans.w[2 + 2 * i], apr_ans.w[3 + 2 * i]);
 		}
 	}
-	signal(SIGTERM, on_sig);
-	signal(SIGINT, on_sig);
+	if (up && tone_secs)
+		tone_rc = tone(tone_secs);
 	uint64_t stay = now_ms() + secs * 1000ull;
 	while (!quit && (!secs || now_ms() < stay))
 		poll_for(100);
 	LOG("adspd: done (the ADSP keeps running; adspd stop shuts it down)");
-	return up ? 0 : 2;
+	return !up ? 2 : tone_rc;
 }
 
 static int stop(void)
@@ -1108,7 +1580,7 @@ int main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	t0 = now_ms();
 	if (argc < 2) {
-		fprintf(stderr, "usage: adspd status | boot [SECS] [force] | stop\n");
+		fprintf(stderr, "usage: adspd status | boot [SECS] [force] | tone [TONE_SECS] [SECS] | stop\n");
 		return 2;
 	}
 	pm_init();
@@ -1119,7 +1591,9 @@ int main(int argc, char **argv)
 	if (!strcmp(argv[1], "status"))
 		return status();
 	if (!strcmp(argv[1], "boot"))
-		return boot(argc > 2 ? (unsigned)atoi(argv[2]) : 20, argc > 3 && !strcmp(argv[3], "force"));
+		return boot(argc > 2 ? (unsigned)atoi(argv[2]) : 20, argc > 3 && !strcmp(argv[3], "force"), 0);
+	if (!strcmp(argv[1], "tone"))	/* boot, then the speakers' path with a tone of TONE_SECS (default 3, at most 10) */
+		return boot(argc > 3 ? (unsigned)atoi(argv[3]) : 2, 0, argc > 2 ? (unsigned)atoi(argv[2]) : 3);
 	if (!strcmp(argv[1], "stop"))
 		return stop();
 	fprintf(stderr, "unknown command %s\n", argv[1]);
