@@ -1294,6 +1294,8 @@ static char sweetMemoryOwnerKey;
 // Metal SPI: memory the GPU shares with the CPU. Unified memory, so all of RAM. Settings > Accessibility asked for it and crashed
 // (surya: "-[NativeBridgeMetalDevice sharedMemorySize]: unrecognized selector").
 - (uint64_t)sharedMemorySize {return [NSProcessInfo processInfo].physicalMemory;}
+// and the memory only the GPU has (asked next, by the same page): none.
+- (uint64_t)dedicatedMemorySize {return 0;}
 - (BOOL)isLowPower {return NO;}
 - (BOOL)isRemovable {return NO;}
 - (BOOL)isHeadless {return NO;}
