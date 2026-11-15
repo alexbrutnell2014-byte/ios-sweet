@@ -14,6 +14,7 @@ $CC -fobjc-arc -framework Foundation -framework SystemConfiguration -o out/netsv
 $CC -fobjc-arc -framework Foundation -framework CFNetwork -o out/nettest nettest.m && sign nettest
 $CC -Wall -o out/cmdd cmdd.c && sign cmdd
 $CC -Wall -o out/psx psx.c && sign psx
+$CC -Wall -o out/mvf mvf.c && sign mvf
 for m in oslog prefs openapp exq; do $CC -fobjc-arc -framework Foundation -o out/$m $m.m && sign $m; done
 $CC -fobjc-arc -framework Foundation -framework MobileCoreServices -o out/lsreg lsreg.m && sign lsreg
 $CC -fobjc-arc -framework Foundation -framework ImageIO -framework CoreGraphics -o out/imgtest imgtest.m && sign imgtest
