@@ -501,6 +501,7 @@ static void notified(void *context,uint64_t value) {
 @public
  EncodedWork encodedWork;   // the command buffer's single encoder thread, not global counter deltas
  uint64_t createdUs;
+ NSMutableDictionary *_userDictionary;
 }
 @property(nonatomic) NmbCommandBuffer *handle;
 @property(nonatomic,strong) NBQueue *queue;
@@ -786,6 +787,10 @@ static void scheduled(void *context);
  return self;
 }
 - (void)dealloc {nmb_command_buffer_release(_handle);}
+// Metal SPI some frameworks keep per-buffer notes in (surya: 29 MISSING lines in mtl2.log). Made when first asked for.
+- (NSMutableDictionary *)userDictionary {
+ @synchronized(self){if(!_userDictionary)_userDictionary=[NSMutableDictionary dictionary];return _userDictionary;}
+}
 - (id<MTLCommandQueue>)commandQueue {return (id<MTLCommandQueue>)_queue;}
 - (BOOL)retainedReferences {return YES;}
 // Protected content is not supported (the runtime's AppleOnlyCall::SetProtectionOptions takes Metal's default only): any other option fails
@@ -1286,6 +1291,9 @@ static char sweetMemoryOwnerKey;
 - (uint64_t)registryID {return gRegistryID;}
 - (NSUInteger)maxBufferLength {return nmb_device_max_buffer_length(gDevice);}
 - (BOOL)hasUnifiedMemory {return YES;}
+// Metal SPI: memory the GPU shares with the CPU. Unified memory, so all of RAM. Settings > Accessibility asked for it and crashed
+// (surya: "-[NativeBridgeMetalDevice sharedMemorySize]: unrecognized selector").
+- (uint64_t)sharedMemorySize {return [NSProcessInfo processInfo].physicalMemory;}
 - (BOOL)isLowPower {return NO;}
 - (BOOL)isRemovable {return NO;}
 - (BOOL)isHeadless {return NO;}
