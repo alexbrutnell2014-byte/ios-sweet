@@ -1,0 +1,150 @@
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 15a801a..df1004b 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -176,4 +176,51 @@ sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val)
+ 	IOLockUnlock(sp_lock);
+ 	return -1;
+ }
++
++/*
++ * Power-off and reboot (SweetPlatformExpert's halt/restart handler): the PM6150 PON block (SID 0, 0x0800),
++ * whose PS_HOLD reset type decides what dropping PS_HOLD does. Its channel is found and mapped at boot
++ * (sweet_spmi_pon_prepare, thread context); sweet_spmi_pon_write runs at halt time with interrupts off, so it
++ * takes no lock and maps nothing.
++ */
++static vm_offset_t sp_pon_ch;
++
++int
++sweet_spmi_pon_prepare(void)
++{
++	if (!sp_ready) {
++		return -1;
++	}
++	IOLockLock(sp_lock);
++	uint16_t apid = sp_find_apid(0x008);
++	unsigned owner = apid == SP_NO_APID ? 7u : (sp_rd(sp_cfg, 0x700u + 4u * apid) & 7u);
++	if (apid != SP_NO_APID && owner == 0 && !sp_poisoned[apid]) {
++		sp_pon_ch = ml_io_map(SP_CHNLS_PA + 0x10000u * apid, 0x1000);
++	}
++	IOLockUnlock(sp_lock);
++	printf("SWEET POWER: PON APID %u owner %u -> %s\n", apid, owner, sp_pon_ch ? "ready" : "NOT WRITABLE");
++	return sp_pon_ch ? 0 : -1;
++}
++
++int
++sweet_spmi_pon_write(unsigned addr, uint8_t val)
++{
++	vm_offset_t ch = sp_pon_ch;
++	if (!ch || (addr >> 8) != 0x08) {
++		return -1;
++	}
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(ch + 0x10u) = val;			/* WDATA0 */
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(ch + 0x00u) = (addr & 0xffu) << 4;	/* EXT_WRITEL (0), BC=0 */
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t status = sp_rd(ch, 0x08u);
++		if (status & 1u) {
++			return (status & 0x0eu) ? -1 : 0;
++		}
++		delay(1);
++	}
++	return -1;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_spmi.h b/bsd/dev/sweet_spmi.h
+index 5b50a41..86609b9 100644
+--- a/bsd/dev/sweet_spmi.h
++++ b/bsd/dev/sweet_spmi.h
+@@ -10,6 +10,9 @@ int sweet_spmi_init(void);
+ int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+ /* surya WLED (SID 5, 0xd800/0xd900) and the SMB5 charger (SID 0, 0x1000/0x1300) only; thread context. */
+ int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val);
++/* PON (SID 0, 0x0800) for power-off/reboot: prepare in thread context; write is lock-free, for halt time. */
++int sweet_spmi_pon_prepare(void);
++int sweet_spmi_pon_write(unsigned addr, uint8_t val);
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 6420f49..336d6f1 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -87,6 +87,60 @@ SweetPlatformExpert::setGMTTimeOfDay(long secs)
+ }
+ /* surya: no sweet_log_mirror_start(): flame's 0x1fe000000 mirror is past the end of RAM. */
+ 
++/*
++ * Power-off and reboot. Without a PE_halt_restart handler XNU's halt_all_cpus() printed "CPU halted" and spun
++ * forever with every core on: "Slide to power off" left a dark phone that emptied its battery in about an hour,
++ * and a reboot from iOS never rebooted. As downstream msm-poweroff + qpnp-power-on (gen2 PON) do: PS_HOLD reset
++ * type in the PM6150 PON (PS_HOLD_RESET_CTL 0x85a: 0x04 shutdown, 0x07 hard reset; CTL2 0x85b bit 7 enables it,
++ * cleared around the change with a few sleep-clock cycles between), then PSCI SYSTEM_OFF / SYSTEM_RESET, which
++ * TrustZone carries out by dropping PS_HOLD. Panics keep their screen (only the halt and restart types are taken).
++ */
++#define PON_PS_HOLD_RESET_CTL   0x085a
++#define PON_PS_HOLD_RESET_CTL2  0x085b
++#define PSCI_SYSTEM_OFF         0x84000008ULL
++#define PSCI_SYSTEM_RESET       0x84000009ULL
++
++static bool sweet_pon_ready;
++
++static void
++sweet_psci_call(uint64_t fn)
++{
++	register uint64_t x0 __asm__("x0") = fn;
++	register uint64_t x1 __asm__("x1") = 0;
++	register uint64_t x2 __asm__("x2") = 0;
++	register uint64_t x3 __asm__("x3") = 0;
++	__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
++	    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
++	    "x14", "x15", "x16", "x17", "cc", "memory");
++}
++
++static int
++sweet_halt_restart(unsigned int type)
++{
++	uint8_t reset_type;
++	uint64_t fn;
++	if (type == kPEHaltCPU) {
++		reset_type = 0x04;
++		fn = PSCI_SYSTEM_OFF;
++	} else if (type == kPERestartCPU) {
++		reset_type = 0x07;
++		fn = PSCI_SYSTEM_RESET;
++	} else {
++		return -1;
++	}
++	kprintf("SWEET POWER: %s\n", type == kPEHaltCPU ? "power off" : "restart");
++	if (sweet_pon_ready) {
++		int rc = sweet_spmi_pon_write(PON_PS_HOLD_RESET_CTL2, 0x00);
++		delay(100);
++		rc |= sweet_spmi_pon_write(PON_PS_HOLD_RESET_CTL, reset_type);
++		rc |= sweet_spmi_pon_write(PON_PS_HOLD_RESET_CTL2, 0x80);
++		kprintf("SWEET POWER: PS_HOLD reset type %#x -> %d\n", reset_type, rc);
++	}
++	sweet_psci_call(fn);
++	kprintf("SWEET POWER: PSCI %#llx returned\n", fn);
++	return -1;
++}
++
+ bool
+ SweetPlatformExpert::start(IOService *provider)
+ {
+@@ -95,6 +149,14 @@ SweetPlatformExpert::start(IOService *provider)
+ 		return false;
+ 	}
+ 	sweet_poke_start();             /* register scripts: bsd/dev/sweet_poke.c */
++	if (sweet_spmi_init() == 0 && sweet_spmi_pon_prepare() == 0) {
++		uint8_t ctl = 0, ctl2 = 0;
++		(void)sweet_spmi_read(0, PON_PS_HOLD_RESET_CTL, &ctl);
++		(void)sweet_spmi_read(0, PON_PS_HOLD_RESET_CTL2, &ctl2);
++		IOLog("SWEET POWER: PS_HOLD reset type %#x (ctl2 %#x) as the loader left it\n", ctl, ctl2);
++		sweet_pon_ready = true;
++	}
++	PE_halt_restart = sweet_halt_restart;
+ 	{
+ 		uint32_t rtc = 0;
+ 		uint8_t ctrl = 0;
