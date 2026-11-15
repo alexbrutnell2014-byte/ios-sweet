@@ -347,13 +347,33 @@ static int load_and_start(void)
 		memcpy(meta + ehsz, h, ph[hash].filesz);
 		free(h);
 	}
-	/* every loadable segment inside the region, before anything is asked of TrustZone */
+	/*
+	 * Relocation (Linux qcom_mdt_load): if any segment has QCOM_MDT_RELOCATABLE (flags bit 27), the image goes at
+	 * the region's base, every segment at base + (paddr - lowest paddr). Then every segment must fit the region,
+	 * checked before anything is asked of TrustZone.
+	 */
+	uint64_t min_pa = ~0ull, max_pa = 0;
+	int reloc = 0;
+	for (uint32_t i = 0; i < phnum; i++) {
+		if (ph[i].type != 1 || ((ph[i].flags >> 24) & 7) == 2 || !ph[i].memsz)
+			continue;
+		if (ph[i].flags & (1u << 27))
+			reloc = 1;
+		if (ph[i].paddr < min_pa)
+			min_pa = ph[i].paddr;
+		if (ph[i].paddr + (uint64_t)ph[i].memsz > max_pa)
+			max_pa = ph[i].paddr + (uint64_t)ph[i].memsz;
+	}
+	int64_t shift = reloc ? (int64_t)ADSP_PA - (int64_t)min_pa : 0;
+	LOG("boot: image %llx-%llx (%llu KB), %s", (unsigned long long)min_pa, (unsigned long long)max_pa,
+	    (unsigned long long)((max_pa - min_pa) >> 10), reloc ? "relocatable: placed at the region's base" : "fixed");
 	for (uint32_t i = 0; i < phnum; i++) {
 		if (ph[i].type != 1 || (int)i == hash || !ph[i].memsz)
 			continue;
-		if (ph[i].paddr < ADSP_PA || ph[i].paddr + (uint64_t)ph[i].memsz > ADSP_PA + ADSP_SIZE) {
-			LOG("boot: segment %u at %x+%x outside the region %llx+%llx", i, ph[i].paddr, ph[i].memsz, ADSP_PA,
-			    ADSP_SIZE);
+		uint64_t pa = (uint64_t)((int64_t)ph[i].paddr + shift);
+		if (pa < ADSP_PA || pa + (uint64_t)ph[i].memsz > ADSP_PA + ADSP_SIZE) {
+			LOG("boot: segment %u at %llx+%x outside the region %llx+%llx", i, (unsigned long long)pa, ph[i].memsz,
+			    ADSP_PA, ADSP_SIZE);
 			return -1;
 		}
 	}
@@ -377,7 +397,7 @@ static int load_and_start(void)
 	for (uint32_t i = 0; i < phnum; i++) {
 		if (ph[i].type != 1 || (int)i == hash || !ph[i].memsz)
 			continue;
-		uint64_t pa = ph[i].paddr;
+		uint64_t pa = (uint64_t)((int64_t)ph[i].paddr + shift);
 		if (ph[i].filesz) {
 			char path[128];
 			size_t sl;
