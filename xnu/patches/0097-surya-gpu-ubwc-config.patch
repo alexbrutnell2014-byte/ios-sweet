@@ -1,0 +1,19 @@
+diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
+index 30aa0f8..cdf0f07 100755
+--- a/bsd/dev/sweet_a6xx.c
++++ b/bsd/dev/sweet_a6xx.c
+@@ -1226,7 +1226,13 @@ static int gpu_cp_init(struct a6_gpu *g, bool resume)
+ 		{ 0x0e19, (1u << 7) | 1 },		/* UCHE_CLIENT_PF */
+ 		{ 0x9e00, 0x00180000 },			/* PC_DBG_ECO_CNTL: prim_fifo_threshold */
+ 		{ 0x08d0, 0 },				/* CP_PERFCTR_CP_SEL[0]: always count */
+-		/* (A640 UBWC config left out: the A618 values come with real rendering) */
++		/*
++		 * KGSL a6xx_start for surya's DT: qcom,highest-bank-bit 14 (field 14 - 13 = 1), min-access-length 32 (0),
++		 * ubwc-mode 2 (UBWC 2.0: mode bit 0, no AMSBC). Turnip only writes SP_NC_MODE_CNTL_2 and takes hbb 14
++		 * from SweetAccelerator's device info, so these must match it.
++		 */
++		{ 0x8e08, 1u << 1 }, { 0xb604, 1u << 1 }, { 0xae02, 1u << 1 },
++		{ 0x0e01, 1u << 21 }, { 0x0534, 0 },
+ 	};
+ 	for (unsigned i = 0; i < sizeof(init) / sizeof(init[0]); i++)
+ 		wr32(GREG(init[i][0]), init[i][1]);

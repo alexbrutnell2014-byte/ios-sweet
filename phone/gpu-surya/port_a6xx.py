@@ -371,7 +371,13 @@ c = sub(c, '{ 0x08c2, 0x02000140 }, { 0x08c1, 0x8040362c }, { 0x08c3, 128 },\t/*
 c = sub(c, '''		/* a6xx_set_ubwc_config: highest bank bit 15 (hbb_lo 2), AMSBC, UBWC 3 */
 		{ 0x8e08, (1u << 4) | (2u << 1) }, { 0xb604, 2u << 1 }, { 0xae02, 2u << 1 },
 		{ 0x0e01, 2u << 21 }, { 0x0534, 0 },
-''', '''		/* (A640 UBWC config left out: the A618 values come with real rendering) */
+''', '''		/*
+		 * KGSL a6xx_start for surya's DT: qcom,highest-bank-bit 14 (field 14 - 13 = 1), min-access-length 32 (0),
+		 * ubwc-mode 2 (UBWC 2.0: mode bit 0, no AMSBC). Turnip only writes SP_NC_MODE_CNTL_2 and takes hbb 14
+		 * from SweetAccelerator's device info, so these must match it.
+		 */
+		{ 0x8e08, 1u << 1 }, { 0xb604, 1u << 1 }, { 0xae02, 1u << 1 },
+		{ 0x0e01, 1u << 21 }, { 0x0534, 0 },
 ''', 'ubwc')
 
 # ---------------- GPU SMMU on surya: stream matching is not ours to write ----------------
