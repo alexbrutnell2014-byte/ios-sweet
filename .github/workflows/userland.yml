@@ -22,6 +22,8 @@ jobs:
         run: sh phone/wifi-surya/build.sh
       - name: tools (surya)
         run: sh phone/tools-surya/build.sh
+      - name: adspd (surya audio DSP)
+        run: sh phone/audio-surya/build.sh
       - name: test app
         run: sh phone/testapp/build.sh
       - uses: actions/upload-artifact@v4
@@ -31,4 +33,5 @@ jobs:
             phone/wifi-surya/out/
             phone/tools-surya/out/
             phone/testapp/out/SweetHello.ipa
+            phone/audio-surya/out/
           retention-days: 30
