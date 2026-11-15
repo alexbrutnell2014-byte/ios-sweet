@@ -122,8 +122,36 @@ static void run(const char *name)
 	unlink(run);
 }
 
+/*
+ * The kernel's message buffer, 90 s into each boot, to /var/local/dmesg-boot.txt (the previous boot's to
+ * dmesg-boot.prev.txt): the USB live log is gone when USB does not come up, and the on-disk ring only
+ * holds the current boot.
+ */
+#include <sys/sysctl.h>
+static void save_msgbuf(void)
+{
+	sleep(90);
+	size_t len = 0;
+	if (sysctlbyname("kern.msgbuf", NULL, &len, NULL, 0) != 0 || len == 0)
+		return;
+	char *buf = malloc(len + 1);
+	if (!buf || sysctlbyname("kern.msgbuf", buf, &len, NULL, 0) != 0)
+		return;
+	rename("/var/local/dmesg-boot.txt", "/var/local/dmesg-boot.prev.txt");
+	FILE *f = fopen("/var/local/dmesg-boot.txt", "w");
+	if (f) {
+		fwrite(buf, 1, strnlen(buf, len), f);
+		fclose(f);
+	}
+	free(buf);
+}
+
 int main(void)
 {
+	if (fork() == 0) {
+		save_msgbuf();
+		_exit(0);
+	}
 	mkdir(DIR_CMD, 0700);
 	chmod(DIR_CMD, 0700);
 	signal(SIGPIPE, SIG_IGN);
