@@ -223,17 +223,32 @@ static int rx_one(void)
 	return 1;
 }
 
+/*
+ * Polling cadence: every 1 ms while the radio or GLINK has traffic, every 5 ms once nothing came for 300 ms.
+ * Every poll reads the copy-engine indices through /dev/pmem; at 1 kHz around the clock an idle wland took
+ * ~15% of a core (battery). The first frame after a quiet spell waits at most 5 ms.
+ */
+static uint64_t last_activity;
+
+void link_activity(void)
+{
+	last_activity = now_ms();
+}
+
 int link_poll(unsigned ms)
 {
 	uint64_t end = now_ms() + ms;
 	int n = 0;
 	do {
+		int got = 0;
 		while (rx_one())
-			n++;
+			n++, got = 1;
+		if (got)
+			link_activity();
 		if (link_idle)
 			link_idle();
 		if (ms)
-			delay_ms(1);
+			delay_ms(now_ms() - last_activity > 300 ? 5 : 1);
 	} while (now_ms() < end);
 	return n;
 }

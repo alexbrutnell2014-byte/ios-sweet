@@ -487,6 +487,8 @@ void ipnet_poll(void)
 	}
 	for (int n = 0; tun >= 0 && dstate >= D_BOUND && n < 16; n++) {
 		ssize_t r = read(tun, in, sizeof(in));
+		if (r > 0)
+			link_activity();	/* outbound traffic: poll the radio at 1 ms for the replies */
 		if (r <= 4)
 			break;
 		uint32_t af;

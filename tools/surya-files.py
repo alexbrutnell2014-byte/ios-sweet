@@ -11,7 +11,7 @@
 """
 import os, socket, stat, sys
 
-HOST, PORT = '127.0.0.1', 2223
+HOST, PORT = '192.168.7.2', 2223
 
 
 def conn():

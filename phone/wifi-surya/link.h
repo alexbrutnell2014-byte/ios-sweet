@@ -25,6 +25,7 @@ extern void (*link_idle)(void);	/* called every poll round */
 uint64_t link_ms(void);		/* since the first call */
 int link_up(qrtr_cb_t cb, unsigned timeout_ms);
 int link_poll(unsigned ms);		/* handle what arrived; for ms (0 = just once) */
+void link_activity(void);	/* frames moved: keep polling at 1 ms for a while */
 int link_send(const void *data, uint32_t len);
 int qrtr_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_port,
 	      const void *payload, uint32_t len);

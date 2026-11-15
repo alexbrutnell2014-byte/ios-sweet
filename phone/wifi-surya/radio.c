@@ -314,8 +314,10 @@ static void ce_poll(void)
 			ce_post(c);
 			posted = 1;
 		}
-		if (posted)
+		if (posted) {
 			ce_wr(c, DR_WR_IDX, s->dst_wr);
+			link_activity();
+		}
 	}
 }
 
