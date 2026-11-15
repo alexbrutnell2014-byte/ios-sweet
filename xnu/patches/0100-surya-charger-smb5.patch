@@ -1,0 +1,138 @@
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 79ea02e..b77b6db 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -134,7 +134,9 @@ int
+ sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val)
+ {
+ 	unsigned peripheral = addr >> 8;
+-	if (!sp_ready || sid != 5 || addr > 0xffffu || (peripheral != 0xd8 && peripheral != 0xd9)) {
++	bool wled = sid == 5 && (peripheral == 0xd8 || peripheral == 0xd9);
++	bool charger = sid == 0 && (peripheral == 0x10 || peripheral == 0x13);	/* SMB5 CHGR, USBIN */
++	if (!sp_ready || addr > 0xffffu || (!wled && !charger)) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+diff --git a/bsd/dev/sweet_spmi.h b/bsd/dev/sweet_spmi.h
+index ce7628c..5b50a41 100644
+--- a/bsd/dev/sweet_spmi.h
++++ b/bsd/dev/sweet_spmi.h
+@@ -8,7 +8,7 @@ extern "C" {
+ int sweet_spmi_init(void);
+ /* Thread context only; 0 success, -1 failure; *out unchanged on failure. */
+ int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+-/* surya WLED (SID 5, 0xd800/0xd900) only; thread context. */
++/* surya WLED (SID 5, 0xd800/0xd900) and the SMB5 charger (SID 0, 0x1000/0x1300) only; thread context. */
+ int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val);
+ #ifdef __cplusplus
+ }
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 9969739..82aa8b3 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -15,6 +15,7 @@
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++extern "C" int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val);
+ 
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+@@ -37,6 +38,8 @@ private:
+ 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
+ 	static bool readWord(unsigned address, uint16_t *value);
+ 	static unsigned estimatePercent(unsigned mv);
++	void configureCharger(bool external);
++	uint8_t fChargerApsd;		/* APSD result the charger was last configured for (0 = none) */
+ };
+ OSDefineMetaClassAndStructors(SweetBattery, IOPMPowerSource);
+ 
+@@ -225,6 +228,7 @@ SweetBattery::poll(void)
+ 		return;
+ 	}
+ 	bool external = (usb & 0x10u) != 0;
++	configureCharger(external);
+ 	bool capable = external && (path & 0x10u) && (path & 1u) && !(path & 0x40u);
+ 	unsigned state = charger & 7u;
+ 	bool charging = capable && state >= 1 && state <= 4 &&
+@@ -246,6 +250,80 @@ SweetBattery::poll(void)
+ 	    charging, full, true, currentValid);
+ }
+ 
++/*
++ * surya: the PM6150's SMB5 charger (Linux qpnp-smb5.c / smb5-lib.c). Nothing set it up under iOS: the input
++ * current limit stayed at the USB default (~500 mA) whatever was plugged in, and with the screen on the phone
++ * used more than that - it ran down while "charging". The charger detects the source itself (APSD); here,
++ * once per attach: input limit by source type (DCP/QC/OCP/float 2 A, CDP 1.5 A, plain SDP left at the
++ * hardware's 500 mA), high-current ICL mode (smblib_icl_override SW_OVERRIDE_HC_MODE), and the battery's
++ * fast-charge current 3 A (surya DT fcc-max-ua 6 A). AICL (hardware) still lowers the limit if a charger
++ * sags. Boot-arg sweetcharge=0 leaves the charger alone.
++ */
++#define SMB_APSD_RESULT         0x1308	/* bit0 SDP, 1 OCP, 2 CDP, 3 DCP, 4 float, 5 QC2, 6 QC3 */
++#define SMB_USBIN_ICL_OPTIONS   0x1366	/* bit0 USBIN_MODE_CHG (high-current mode) */
++#define SMB_CMD_ICL_OVERRIDE    0x1342	/* bit0 ICL_OVERRIDE (USB51 mode) */
++#define SMB_USBIN_LOAD_CFG      0x1365	/* bit4 ICL_OVERRIDE_AFTER_APSD */
++#define SMB_USBIN_ICL_CFG       0x1370	/* input current limit, 50 mA steps */
++#define SMB_FCC_CFG             0x1061	/* fast-charge current, 50 mA steps */
++#define SMB_ICL_STATUS          0x1107	/* input current limit in use, 50 mA steps */
++
++static int
++smb_rmw(unsigned addr, uint8_t mask, uint8_t val)
++{
++	uint8_t v;
++	if (sweet_spmi_read(0, addr, &v)) {
++		return -1;
++	}
++	return sweet_spmi_write(0, addr, (uint8_t)((v & ~mask) | (val & mask)));
++}
++
++void
++SweetBattery::configureCharger(bool external)
++{
++	static int enabled = -1;
++	if (enabled < 0) {
++		uint32_t on = 1;
++		PE_parse_boot_argn("sweetcharge", &on, sizeof(on));
++		enabled = on ? 1 : 0;
++	}
++	uint8_t apsd = 0;
++	if (!enabled || !external || sweet_spmi_read(0, SMB_APSD_RESULT, &apsd) || !(apsd & 0x7fu)) {
++		fChargerApsd = 0;		/* detached, or detection not finished: redo on the next attach */
++		return;
++	}
++	if (apsd == fChargerApsd) {
++		return;
++	}
++	unsigned icl_ma = 0;
++	const char *kind;
++	if (apsd & 0x60u) {
++		icl_ma = 2000, kind = "Quick Charge";
++	} else if (apsd & 0x08u) {
++		icl_ma = 2000, kind = "wall charger (DCP)";
++	} else if (apsd & 0x04u) {
++		icl_ma = 1500, kind = "charging USB port (CDP)";
++	} else if (apsd & 0x12u) {
++		icl_ma = 2000, kind = (apsd & 0x10u) ? "non-standard charger (float)" : "proprietary charger (OCP)";
++	} else {
++		kind = "USB port (SDP)";
++	}
++	int rc = 0;
++	if (icl_ma) {
++		rc |= sweet_spmi_write(0, SMB_USBIN_ICL_CFG, (uint8_t)(icl_ma / 50));
++		rc |= smb_rmw(SMB_USBIN_ICL_OPTIONS, 0x01, 0x01);
++		rc |= smb_rmw(SMB_CMD_ICL_OVERRIDE, 0x01, 0x00);
++		rc |= smb_rmw(SMB_USBIN_LOAD_CFG, 0x10, 0x10);
++	}
++	rc |= sweet_spmi_write(0, SMB_FCC_CFG, (uint8_t)(3000 / 50));
++	IODelay(50000);			/* let the DCDC apply the new limit before reading it back */
++	uint8_t icl = 0, fcc = 0;
++	(void)sweet_spmi_read(0, SMB_ICL_STATUS, &icl);
++	(void)sweet_spmi_read(0, SMB_FCC_CFG, &fcc);
++	IOLog("SWEET CHARGER: %s (APSD %02x): input limit %s%u mA, in use %u mA, charge current %u mA%s\n", kind, apsd,
++	    icl_ma ? "" : "hardware ", icl_ma ? icl_ma : 500, icl * 50u, fcc * 50u, rc ? " (some writes refused)" : "");
++	fChargerApsd = apsd;
++}
++
+ void
+ SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
+ {
