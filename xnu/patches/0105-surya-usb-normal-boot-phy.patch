@@ -1,0 +1,36 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 22053f9..04d361b 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -104,10 +104,20 @@ usb_cold_power(vm_offset_t gcc)
+ {
+ 	uint32_t g = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
+ 	if (g & (1u << 31)) {
+-		return 0;			/* ABL (fastboot) left it on */
++		/*
++		 * Powered, but did ABL run USB? After a normal power-on ABL leaves the GDSC and clocks on but never
++		 * starts the device (no event buffer, no device events) and the QUSB2 PHY is not running: the first
++		 * endpoint command then timed out. After fastboot both are set.
++		 */
++		vm_offset_t d = ml_io_map(DWC3_PA, DWC3_SIZE);
++		bool abl_ran = d && (usb_rd(d, 0xc400) || usb_rd(d, 0xc404) || usb_rd(d, 0xc708));
++		if (abl_ran) {
++			return 0;		/* ABL (fastboot) left it running */
++		}
++		printf("SWEET USB: normal boot: USB powered but not started by ABL (DEVTEN 0, no event buffer)\n");
+ 	}
+ 	ud_cold = true;
+-	printf("SWEET USB: cold boot: GDSC 0x%08x off, powering USB up\n", g);
++	printf("SWEET USB: cold boot: GDSC 0x%08x, powering USB up\n", g);
+ 	int r4 = sweet_rpmh_vreg_enable("ldoa4", 880);
+ 	int r11 = sweet_rpmh_vreg_enable("ldoa11", 1800);
+ 	int r17 = sweet_rpmh_vreg_enable("ldoa17", 3072);
+@@ -1392,6 +1402,8 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 		dwc_wr(GCTL, dwc_rd(GCTL) | (1u << 11));
+ 		delay(1000);
+ 		dwc_wr(GCTL, (dwc_rd(GCTL) & ~((1u << 11) | (3u << 12))) | (2u << 12));
++		/* DT snps,dis_u2_susphy_quirk, snps,dis_enblslpm_quirk: no PHY suspend, no UTMI sleep */
++		dwc_wr(0xc200, dwc_rd(0xc200) & ~((1u << 6) | (1u << 8)));
+ 		printf("SWEET USB: cold: core reset, GCTL 0x%08x GUSB2PHYCFG 0x%08x\n", dwc_rd(GCTL), dwc_rd(0xc200));
+ 	}
+ 	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
