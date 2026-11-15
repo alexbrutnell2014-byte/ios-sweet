@@ -1,0 +1,27 @@
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 82aa8b3..f8bd9b0 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -223,6 +223,22 @@ SweetBattery::poll(void)
+ 	unsigned mv = valid ? (unsigned)(((uint64_t)rawVoltage * 194637u) / 1000000u) : 0;
+ 	/* Zero, reset, floating, or implausible data cannot become 0% battery. */
+ 	valid = valid && mv >= 2800 && mv <= 4600;
++	if (!valid && fReal) {
++		/* surya: say once which read failed (every boot showed the static fallback) */
++		static bool told;
++		if (!told) {
++			told = true;
++			uint8_t b[10] = { 0 };
++			int r[10];
++			static const unsigned a[10] = { 0x4804, 0x4805, 0x4808, 0x48c0, 0x48c1, 0x1310, 0x110b, 0x1006, 0x1007, 0x100d };
++			for (unsigned i = 0; i < 10; i++) {
++				r[i] = sweet_spmi_read(0, a[i], &b[i]);
++			}
++			IOLog("SWEET BATTERY: gauge unreadable: QG type %02x(%d) subtype %02x(%d) status %02x(%d) vbat %02x%02x(%d,%d) "
++			    "usbin %02x(%d) path %02x(%d) chg %02x(%d) err %02x(%d) temp %02x(%d)\n",
++			    b[0], r[0], b[1], r[1], b[2], r[2], b[4], b[3], r[3], r[4], b[5], r[5], b[6], r[6], b[7], r[7], b[8], r[8], b[9], r[9]);
++		}
++	}
+ 	if (!valid) {
+ 		publish(100, 4200, 0, true, true, false, true, false, false);
+ 		return;
