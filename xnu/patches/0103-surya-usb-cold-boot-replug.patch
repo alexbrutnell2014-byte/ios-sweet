@@ -1,0 +1,237 @@
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index de55b19..a792582 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -372,7 +372,11 @@ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ 	/* ldoc11: sweet touch (2950..3400 mV); ldoa18: surya NT36672C vddio (1.8 V). */
+ 	bool l11c = res && !strcmp(res, "ldoc11") && mv >= 2950 && mv <= 3400;
+ 	bool l18a = res && !strcmp(res, "ldoa18") && mv >= 1650 && mv <= 1950;
+-	if (!l11c && !l18a) {
++	/* surya USB QUSB2 PHY: vdd ldoa4 0.88 V, vdda18 ldoa11 1.8 V, vdda33 ldoa17 3.0-3.1 V */
++	bool usb = res && ((!strcmp(res, "ldoa4") && mv >= 860 && mv <= 900) ||
++	    (!strcmp(res, "ldoa11") && mv >= 1750 && mv <= 1850) ||
++	    (!strcmp(res, "ldoa17") && mv >= 3000 && mv <= 3104));
++	if (!l11c && !l18a && !usb) {
+ 		printf("SWEET RPMH: expected ldoc11 2950..3400 mV or ldoa18 1650..1950 mV\n");
+ 		return EINVAL;
+ 	}
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 032adc8..22053f9 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -52,14 +52,14 @@ static const struct {
+ 	const char *name;
+ 	uint32_t    off;
+ } usb_cbcr[] = {
+-	/* flame (SM8150, gcc-sm8150.c); index 0 master and 3 cfg-noc-axi gate DWC3 reads */
++	/* surya (SM7150, gcc-sdmmagpie.c); index 0 master and 3 cfg-noc-axi gate DWC3 reads */
+ 	{ "master", 0x0f010 },
+ 	{ "sleep", 0x0f014 },
+ 	{ "utmi", 0x0f018 },
+-	{ "cfg-noc-axi", 0x0f078 },
+-	{ "aggre-axi", 0x0f07c },
+-	{ "phy-aux", 0x0f050 },
+-	{ "clkref", 0x8c008 },
++	{ "cfg-noc-axi", 0x0502c },
++	{ "aggre-axi", 0x8201c },
++	{ "ahb2phy", 0x6a004 },
++	{ "clkref", 0x8c010 },
+ };
+ 
+ #define DWC3_PA                 0x0a600000
+@@ -75,6 +75,93 @@ usb_rd(vm_offset_t base, uint32_t off)
+ 	return v;
+ }
+ 
++/*
++ * surya: after a normal power-on (no fastboot) ABL leaves USB off: the USB30_PRIM GDSC collapsed, the clocks
++ * gated and the QUSB2 PHY unpowered, so the device never appeared. Bring it up as Linux does (gdsc, clk
++ * rcg2/branch, dwc3-msm, phy-msm-qusb-v2.c), only when the GDSC is off: after fastboot ABL's setup is used as
++ * before. Every step is logged (the persistent log keeps it when USB does not come up).
++ */
++static bool ud_cold;
++extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++
++static void
++usb_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* surya DT qusb@88e2000 qcom,qusb-phy-init-seq: value, offset pairs (PWR_CTRL1 0x210 down first, up last) */
++static const uint32_t qusb2_init_seq[] = {
++	0x23, 0x210, 0x03, 0x04, 0x7c, 0x18c, 0x80, 0x2c, 0x0a, 0x184, 0x19, 0xb4, 0x40, 0x194,
++	0x22, 0x198, 0x21, 0x214, 0x08, 0x220, 0x58, 0x224, 0x77, 0x240, 0x7c, 0x244, 0xca, 0x248,
++	0x04, 0x24c, 0x03, 0x250, 0x30, 0x23c, 0x22, 0x210,
++};
++
++static int
++usb_cold_power(vm_offset_t gcc)
++{
++	uint32_t g = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
++	if (g & (1u << 31)) {
++		return 0;			/* ABL (fastboot) left it on */
++	}
++	ud_cold = true;
++	printf("SWEET USB: cold boot: GDSC 0x%08x off, powering USB up\n", g);
++	int r4 = sweet_rpmh_vreg_enable("ldoa4", 880);
++	int r11 = sweet_rpmh_vreg_enable("ldoa11", 1800);
++	int r17 = sweet_rpmh_vreg_enable("ldoa17", 3072);
++	printf("SWEET USB: cold: PHY supplies ldoa4 %d ldoa11 %d ldoa17 %d\n", r4, r11, r17);
++	usb_wr(gcc, GCC_USB30_PRIM_GDSCR, g & ~1u);	/* SW_COLLAPSE off */
++	int i;
++	for (i = 0; i < 100 && !(usb_rd(gcc, GCC_USB30_PRIM_GDSCR) & (1u << 31)); i++) {
++		delay(100);
++	}
++	printf("SWEET USB: cold: GDSC 0x%08x after %d00 us\n", usb_rd(gcc, GCC_USB30_PRIM_GDSCR), i);
++	/* master 200 MHz: GPLL0_OUT_MAIN (src 1) / 3 (2*3-1); mock_utmi 19.2 MHz: XO (src 0) / 1 */
++	usb_wr(gcc, 0xf01c + 4, (1u << 8) | 5u);
++	usb_wr(gcc, 0xf01c, usb_rd(gcc, 0xf01c) | 1u);		/* CMD_UPDATE */
++	usb_wr(gcc, 0xf034 + 4, (0u << 8) | 1u);
++	usb_wr(gcc, 0xf034, usb_rd(gcc, 0xf034) | 1u);
++	for (i = 0; i < 100 && ((usb_rd(gcc, 0xf01c) | usb_rd(gcc, 0xf034)) & 1u); i++) {
++		delay(10);
++	}
++	static const uint32_t branches[] = { 0x0f010, 0x0f014, 0x0f018, 0x0502c, 0x8201c, 0x6a004, 0x8c010 };
++	for (unsigned b = 0; b < sizeof(branches) / sizeof(branches[0]); b++) {
++		usb_wr(gcc, branches[b], usb_rd(gcc, branches[b]) | 1u);
++	}
++	for (i = 0; i < 100 && ((usb_rd(gcc, 0x0f010) | usb_rd(gcc, 0x0502c)) & CBCR_CLK_OFF); i++) {
++		delay(10);
++	}
++	printf("SWEET USB: cold: rcg master 0x%08x/0x%08x utmi 0x%08x, CBCR master 0x%08x cfg-noc 0x%08x\n",
++	    usb_rd(gcc, 0xf01c), usb_rd(gcc, 0xf020), usb_rd(gcc, 0xf038), usb_rd(gcc, 0x0f010), usb_rd(gcc, 0x0502c));
++	/* block resets: QUSB2 PHY, then the controller */
++	usb_wr(gcc, 0x26000, 1u);
++	delay(100);
++	usb_wr(gcc, 0x26000, 0u);
++	usb_wr(gcc, 0x0f000, 1u);
++	delay(100);
++	usb_wr(gcc, 0x0f000, 0u);
++	delay(100);
++	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
++	if (phy == 0) {
++		printf("SWEET USB: cold: QUSB2 map failed\n");
++		return -1;
++	}
++	for (unsigned k = 0; k + 1 < sizeof(qusb2_init_seq) / sizeof(qusb2_init_seq[0]); k += 2) {
++		usb_wr(phy, qusb2_init_seq[k + 1], qusb2_init_seq[k]);
++		if (k == 0) {
++			delay(10);
++		}
++	}
++	for (i = 0; i < 100 && !(usb_rd(phy, 0x1a0) & 1u); i++) {
++		delay(100);
++	}
++	printf("SWEET USB: cold: QUSB2 PLL status 0x%08x after %d00 us, PWR_CTRL1 0x%08x\n",
++	    usb_rd(phy, 0x1a0), i, usb_rd(phy, 0x210));
++	return 1;
++}
++
+ void
+ sweet_usb_probe(void)
+ {
+@@ -92,6 +179,9 @@ sweet_usb_probe(void)
+ 		printf("SWEET USB: GCC map failed\n");
+ 		return;
+ 	}
++	if (enabled >= 2) {
++		(void)usb_cold_power(gcc);
++	}
+ 	gdscr = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
+ 	printf("SWEET USB: GDSC usb30_prim 0x%08x (%s)\n", gdscr, (gdscr & (1u << 31)) ? "on" : "off");
+ 	for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
+@@ -766,6 +856,48 @@ ud_if_create(void)
+ 	printf("SWEET USB: ue0 192.168.7.2/24 %s (err %d)\n", err ? "NOT configured" : "up", err);
+ }
+ 
++/*
++ * A cable replug (or a host reset) arrives as disconnect / bus reset. As Linux dwc3
++ * (dwc3_stop_active_transfers, ep0 back to SETUP): end the data endpoints' transfers, drop the
++ * configuration (SET_CONFIGURATION builds it again), rearm control. Before this only the address
++ * was cleared and the old transfers stayed, so after a replug the host enumerated the phone but no
++ * frame went through.
++ */
++static void
++ud_end_transfer(unsigned ep)
++{
++	uint32_t rsc = (dwc_rd(DEPCMD(ep)) >> 16) & 0x7f;
++	(void)ud_epcmd(ep, 8u | (1u << 11) | (rsc << 16), 0, 0, 0);	/* ENDTRANSFER, ForceRM */
++}
++
++static void
++ud_bus_reset(const char *why)
++{
++	uint32_t ena = dwc_rd(DALEPENA);
++	static const unsigned eps[] = { EP_RX, EP_TX, EP_INT };
++	for (unsigned i = 0; i < 3; i++) {
++		if (ena & (1u << eps[i])) {
++			ud_end_transfer(eps[i]);
++		}
++	}
++	dwc_wr(DALEPENA, ena & 0x3u);
++	bool was = ud.configured;
++	lck_mtx_lock(ud.lock);
++	ud.configured = false;
++	ud.tx_busy = false;
++	lck_mtx_unlock(ud.lock);
++	ud.data_alt = 0;
++	if (was) {
++		ud_link_event(false);
++	}
++	if (ud.state != EP0_SETUP) {
++		ud_end_transfer(0);
++		ud_end_transfer(1);
++		ud_start_setup();
++	}
++	printf("SWEET USB: %s: transfers ended, configuration dropped%s\n", why, was ? " (link down)" : "");
++}
++
+ static void
+ ud_event(uint32_t ev)
+ {
+@@ -773,7 +905,7 @@ ud_event(uint32_t ev)
+ 		uint32_t type = (ev >> 8) & 0xf;
+ 		if (type == 1) {        /* USB reset */
+ 			dwc_wr(DCFG, dwc_rd(DCFG) & ~(0x7fu << 3));
+-			printf("SWEET USB: bus reset\n");
++			ud_bus_reset("bus reset");
+ 		} else if (type == 2) { /* connect done */
+ 			uint32_t speed = dwc_rd(DSTS) & 7;
+ 			/* ep0 max packet: 64 at high/full speed (modify action) */
+@@ -783,7 +915,7 @@ ud_event(uint32_t ev)
+ 			    (1u << 8) | (1u << 10) | (1u << 25), 0);
+ 			printf("SWEET USB: connected, speed %u\n", speed);
+ 		} else if (type == 0) {
+-			printf("SWEET USB: disconnect\n");
++			ud_bus_reset("disconnect");
+ 		}
+ 		return;
+ 	}
+@@ -1255,6 +1387,13 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 		return;
+ 	}
+ 
++	if (ud_cold) {
++		/* dwc3_core_init minimum: core soft reset, device role (PRTCAPDIR 2), USB 2.0 PHY interface as reset */
++		dwc_wr(GCTL, dwc_rd(GCTL) | (1u << 11));
++		delay(1000);
++		dwc_wr(GCTL, (dwc_rd(GCTL) & ~((1u << 11) | (3u << 12))) | (2u << 12));
++		printf("SWEET USB: cold: core reset, GCTL 0x%08x GUSB2PHYCFG 0x%08x\n", dwc_rd(GCTL), dwc_rd(0xc200));
++	}
+ 	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
+ 	dwc_wr(DCTL, DCTL_CSFTRST);
+ 	int i;
+@@ -1295,7 +1434,9 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	printf("SWEET USB: step start setup\n");
+ 	ud_start_setup();
+ 	printf("SWEET USB: step qscratch\n");
+-	ud_hsphy_init();
++	if (!ud_cold) {
++		ud_hsphy_init();	/* (flame's femto-PHY writes; surya's QUSB2 was set up by ABL or usb_cold_power) */
++	}
+ 
+ 	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
+ 	if (qs != 0) {
