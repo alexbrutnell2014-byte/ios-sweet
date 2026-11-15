@@ -140,7 +140,10 @@ static void save_msgbuf(void)
 	rename("/var/local/dmesg-boot.txt", "/var/local/dmesg-boot.prev.txt");
 	FILE *f = fopen("/var/local/dmesg-boot.txt", "w");
 	if (f) {
-		fwrite(buf, 1, strnlen(buf, len), f);
+		/* the buffer is a ring with NUL padding: write every non-NUL byte */
+		for (size_t i = 0; i < len; i++)
+			if (buf[i])
+				fputc(buf[i], f);
 		fclose(f);
 	}
 	free(buf);
