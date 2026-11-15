@@ -74,7 +74,7 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, nvt_fw=None, gpu_fw=None):
+def build(seed=None, qemu=False, highmem=False, nvt_fw=None, gpu_fw=None, display_scale=3):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     # Carve the panic log off the top so the kernel never allocates over it.
@@ -113,7 +113,7 @@ def build(seed=None, qemu=False, highmem=False, nvt_fw=None, gpu_fw=None):
         # from /chosen, the pixel size from IOMobileFramebuffer. Scale 0 makes
         # SpringBoard's FBSDisplayMode "infxinf@0x" invalid. 1080x2400 @3x =
         # 360x800 points (like iPhone X class devices).
-        ('display-scale', u32(3)),
+        ('display-scale', u32(display_scale)),
         # XNU derives IOPlatformUUID (gethostuuid) from these on arm; without
         # them CFPreferences cannot use kCFPreferencesCurrentHost (no ByHost
         # files), so e.g. DataMigration never records LastSystemVersion and
@@ -265,7 +265,10 @@ def build(seed=None, qemu=False, highmem=False, nvt_fw=None, gpu_fw=None):
 if __name__ == '__main__':
     nvt_fw = next((a.split('=', 1)[1] for a in sys.argv if a.startswith('--nvt-fw=')), None)
     gpu_fw = next((a.split('=', 1)[1] for a in sys.argv if a.startswith('--gpu-fw=')), None)
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, nvt_fw=nvt_fw, gpu_fw=gpu_fw)
+    # --display-scale=N: MobileGestalt's screen scale (3 = iPhone X @3x; 2 with the kernel's sweetfb_lw/lh = 750x1624)
+    display_scale = int(next((a.split('=', 1)[1] for a in sys.argv if a.startswith('--display-scale=')), '3'))
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, nvt_fw=nvt_fw, gpu_fw=gpu_fw,
+                 display_scale=display_scale)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

@@ -1,0 +1,29 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 6f3c550..338e368 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -230,6 +230,24 @@ AppleCLCD::start(IOService *provider)
+ 		fLogicalW = SWEET_FB_LOGICAL_W;
+ 		fLogicalH = SWEET_FB_LOGICAL_H;
+ 	}
++	/*
++	 * surya: boot-args sweetfb_lw/sweetfb_lh set the size iOS renders at (with /chosen display-scale to match,
++	 * tools/mkadt.py --display-scale). 750x1624 @2x is the iPhone X layout (375x812 pt) with 2.25x fewer
++	 * pixels to shade than 1125x2436 @3x: the Adreno 618 is fill-bound on CA's full-screen passes. Only with
++	 * the GPU present path (sweetgpu=1), which scales any frame size to fit the panel.
++	 */
++	{
++		uint32_t lw = 0, lh = 0;
++		int gpu = 0;
++		PE_parse_boot_argn("sweetfb_lw", &lw, sizeof(lw));
++		PE_parse_boot_argn("sweetfb_lh", &lh, sizeof(lh));
++		PE_parse_boot_argn("sweetgpu", &gpu, sizeof(gpu));
++		if (gpu && lw >= 320 && lh >= 480 && lw <= 4096 && lh <= 4096) {
++			fLogicalW = lw;
++			fLogicalH = lh;
++			IOLog("SWEET FB: iOS renders at %ux%u (sweetfb_lw/lh)\n", lw, lh);
++		}
++	}
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+ 	fCornerRadius = SWEET_DISPLAY_CORNER_DEFAULT;
