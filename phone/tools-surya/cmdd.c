@@ -131,9 +131,16 @@ static void run(const char *name)
 /* libproc (libsystem_kernel): the kernel message buffer, as macOS dmesg reads it; kern.msgbuf is only its size */
 extern int proc_kmsgbuf(void *buffer, uint32_t buffersize);
 
+static void save_msgbuf_to(const char *path, const char *prev);
 static void save_msgbuf(void)
 {
+	save_msgbuf_to("/var/local/dmesg-early.txt", "/var/local/dmesg-early.prev.txt");	/* right at start */
 	sleep(90);
+	save_msgbuf_to("/var/local/dmesg-boot.txt", "/var/local/dmesg-boot.prev.txt");
+}
+
+static void save_msgbuf_to(const char *path, const char *prev)
+{
 	int size = 0;
 	size_t sl = sizeof(size);
 	if (sysctlbyname("kern.msgbuf", &size, &sl, NULL, 0) != 0 || size <= 0)
@@ -146,8 +153,8 @@ static void save_msgbuf(void)
 		free(buf);
 		return;
 	}
-	rename("/var/local/dmesg-boot.txt", "/var/local/dmesg-boot.prev.txt");
-	FILE *f = fopen("/var/local/dmesg-boot.txt", "w");
+	rename(path, prev);
+	FILE *f = fopen(path, "w");
 	if (f) {
 		/* the buffer is a ring with NUL padding: write every non-NUL byte */
 		for (int i = 0; i < n; i++)
