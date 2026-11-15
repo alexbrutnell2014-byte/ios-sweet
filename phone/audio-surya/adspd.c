@@ -1141,7 +1141,11 @@ static int apr_event(const struct apr_hdr *h, const uint32_t *w, uint32_t len)
 static int cmd(const char *what, uint8_t svc, uint16_t port, uint32_t opcode, const void *p, uint32_t len, uint32_t want)
 {
 	if (apr_ask_port(svc, port, opcode, p, len, 1500)) {
-		LOG("tone: %s: NO ANSWER", what);
+		LOG("tone: %s: NO ANSWER in 1.5 s; listening 8 s more", what);
+		uint64_t end = now_ms() + 8000;
+		while (now_ms() < end && !apr_ans.got)
+			poll_for(10);
+		LOG("tone: %s: %s (adsp state %x)", what, apr_ans.got ? "a LATE answer came" : "still nothing", adsp_state);
 		return -1;
 	}
 	if (apr_ans.opcode == APR_BASIC_RSP && apr_ans.w[0] == opcode) {
@@ -1298,8 +1302,8 @@ static void smmu_audio_report_and_off(void)
 	if (smmu_slot < 0)
 		return;
 	uint64_t s = SMMU_PA, cbp = s + (uint64_t)smmu_npage * smmu_psize + (uint64_t)smmu_cb * smmu_psize;
-	uint32_t fsr = rd32(cbp + 0x58);
-	LOG("tone: smmu: CB%d FSR %#x%s", smmu_cb, fsr, fsr ? " (FAULTS: the DSP was refused)" : " (no faults)");
+	uint32_t fsr = rd32(cbp + 0x58);	/* fault bits 0xc00001fe; bits 9-10 are only the format */
+	LOG("tone: smmu: CB%d FSR %#x%s", smmu_cb, fsr, (fsr & 0xc00001feu) ? " (FAULTS: the DSP was refused)" : " (no faults)");
 	wr32(s + 0x800 + 4 * smmu_slot, 0);
 	wr32(s + 0xc00 + 4 * smmu_slot, 0x20000);	/* fault, as an unused entry */
 	wr32(s + smmu_psize + 4 * smmu_cb, 0);
@@ -1341,23 +1345,10 @@ static int tone(unsigned secs)
 	pins_on();
 	if (smmu_audio_identity())
 		goto out;
-	/* the port */
-	clock_on = afe_clock(1) == 0;
-	if (!clock_on)
-		goto out;
-	{
-		struct { uint32_t version; uint16_t bits, lines, stereo, ws_src; uint32_t rate; uint16_t format, reserved; }
-			__attribute__((packed)) i2s = { 1, BITS, 1 /* SD0 */, 1 /* stereo */, 1 /* internal */, RATE, 0, 0 };
-		if (afe_port_param("port 0x1004: I2S SD0, stereo, 16 bits, 48 kHz, master", AFE_MODULE_AUDIO_DEV_INTERFACE,
-				   AFE_PARAM_ID_I2S_CONFIG, &i2s, sizeof(i2s)))
-			goto out;
-	}
-	port_on = cmd("port 0x1004, start", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_START, start, sizeof(start), 0) == 0;
-	if (!port_on)
-		goto out;
-	pin_activity(53, "bit clock");
-	pin_activity(54, "word select");
-	/* the stream */
+	/*
+	 * In the order that tells most when something stays silent: ASM first (memory only, no hardware), then
+	 * the port's settings (no hardware yet), then the bit clock and the port's start (LPASS hardware).
+	 */
 	{
 		uint64_t a = DSP_ADDR(BUF_PA);
 		struct { uint16_t pool, regions; uint32_t property, lo, hi, size; } __attribute__((packed)) map =
@@ -1372,6 +1363,23 @@ static int tone(unsigned secs)
 		map_handle = apr_ans.w[0];
 		LOG("tone: %u KB at %#llx are the DSP's handle %#x", BUF_BYTES / 1024, (unsigned long long)a, map_handle);
 	}
+	/* the port */
+	{
+		struct { uint32_t version; uint16_t bits, lines, stereo, ws_src; uint32_t rate; uint16_t format, reserved; }
+			__attribute__((packed)) i2s = { 1, BITS, 1 /* SD0 */, 1 /* stereo */, 1 /* internal */, RATE, 0, 0 };
+		if (afe_port_param("port 0x1004: I2S SD0, stereo, 16 bits, 48 kHz, master", AFE_MODULE_AUDIO_DEV_INTERFACE,
+				   AFE_PARAM_ID_I2S_CONFIG, &i2s, sizeof(i2s)))
+			goto out;
+	}
+	clock_on = afe_clock(1) == 0;
+	if (!clock_on)
+		goto out;
+	port_on = cmd("port 0x1004, start", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_START, start, sizeof(start), 0) == 0;
+	if (!port_on)
+		goto out;
+	pin_activity(53, "bit clock");
+	pin_activity(54, "word select");
+	/* the stream */
 	{
 		struct { uint16_t flags, mode, ep1, ep2; uint32_t topology; uint16_t channels, bits; uint32_t rate; uint8_t map[8]; }
 			__attribute__((packed)) open = { 0, 1 /* playback */, AFE_PORT, 0xffff, ADM_TOPOLOGY_NONE, 2, BITS, RATE,
