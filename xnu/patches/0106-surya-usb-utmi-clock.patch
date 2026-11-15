@@ -1,0 +1,51 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 04d361b..8764475 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -118,9 +118,21 @@ usb_cold_power(vm_offset_t gcc)
+ 	}
+ 	ud_cold = true;
+ 	printf("SWEET USB: cold boot: GDSC 0x%08x, powering USB up\n", g);
+-	int r4 = sweet_rpmh_vreg_enable("ldoa4", 880);
+-	int r11 = sweet_rpmh_vreg_enable("ldoa11", 1800);
+-	int r17 = sweet_rpmh_vreg_enable("ldoa17", 3072);
++	int r4 = 16, r11 = 16, r17 = 16;
++	for (int t = 0; t < 200 && (r4 == 16 || r11 == 16 || r17 == 16); t++) {	/* EBUSY: retry */
++		if (r4 == 16) {
++			r4 = sweet_rpmh_vreg_enable("ldoa4", 880);
++		}
++		if (r11 == 16) {
++			r11 = sweet_rpmh_vreg_enable("ldoa11", 1800);
++		}
++		if (r17 == 16) {
++			r17 = sweet_rpmh_vreg_enable("ldoa17", 3072);
++		}
++		if (r4 == 16 || r11 == 16 || r17 == 16) {
++			delay(5000);
++		}
++	}
+ 	printf("SWEET USB: cold: PHY supplies ldoa4 %d ldoa11 %d ldoa17 %d\n", r4, r11, r17);
+ 	usb_wr(gcc, GCC_USB30_PRIM_GDSCR, g & ~1u);	/* SW_COLLAPSE off */
+ 	int i;
+@@ -1398,6 +1410,21 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	}
+ 
+ 	if (ud_cold) {
++		/*
++		 * dwc3-msm for maximum-speed <= high: the core takes the UTMI clock instead of the SuperSpeed PHY's
++		 * PIPE clock. After fastboot ABL had the SS PHY running; after a normal boot it is off, the core had
++		 * no clock and every endpoint command timed out. QSCRATCH GENERAL_CFG: PIPE_UTMI_CLK_DIS (8) on,
++		 * PIPE_UTMI_CLK_SEL (0) | PIPE3_PHYSTATUS_SW (3), then PIPE_UTMI_CLK_DIS off.
++		 */
++		vm_offset_t q = ml_io_map(QSCRATCH_PA, 0x100);
++		if (q) {
++			usb_wr(q, 0x08, usb_rd(q, 0x08) | (1u << 8));
++			delay(2);
++			usb_wr(q, 0x08, usb_rd(q, 0x08) | (1u << 0) | (1u << 3));
++			delay(2);
++			usb_wr(q, 0x08, usb_rd(q, 0x08) & ~(1u << 8));
++			printf("SWEET USB: cold: UTMI clock for the core, GENERAL_CFG 0x%08x\n", usb_rd(q, 0x08));
++		}
+ 		/* dwc3_core_init minimum: core soft reset, device role (PRTCAPDIR 2), USB 2.0 PHY interface as reset */
+ 		dwc_wr(GCTL, dwc_rd(GCTL) | (1u << 11));
+ 		delay(1000);
