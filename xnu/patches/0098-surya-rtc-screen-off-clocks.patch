@@ -1,0 +1,203 @@
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index e2a84b9..d50382a 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -17,6 +17,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void sweet_cpufreq_init(void);
++void sweet_cpufreq_screen(int on);
+ 
+ #define OSM_FREQ_REG    0x110u          /* + 32 * index */
+ #define OSM_ROW         32u
+@@ -32,6 +33,11 @@ static const struct {
+ 	{"perfcl (A76 x2)", 0x18325800u},
+ };
+ 
++/* per cluster: mapping, index chosen at boot (screen on), index for screen off */
++static vm_offset_t osm_base[2];
++static unsigned osm_on[2], osm_off[2];
++static bool osm_ready;
++
+ static uint32_t
+ osm_rd(vm_offset_t base, uint32_t off)
+ {
+@@ -82,6 +88,23 @@ sweet_cpufreq_init(void)
+ 			printf("SWEET CPUFREQ: %s index %u kept\n", osm_clusters[c].name, cur);
+ 			continue;
+ 		}
++		osm_base[c] = base;
++		osm_on[c] = best;
++		osm_off[c] = 0;
++		{
++			/* screen off: pwrcl at most 1017 MHz (background work still runs), perfcl at its lowest */
++			unsigned cap_khz = c == 0 ? 1017000u : 0u, prev = 0;
++			for (unsigned i = 0; i < n; ++i) {
++				uint32_t data = osm_rd(base, OSM_FREQ_REG + i * OSM_ROW);
++				unsigned src = data >> 30, lval = data & 0xffu, cores = (data >> 16) & 7u;
++				unsigned khz = src ? OSM_XO_KHZ * lval : 300000u;
++				if (cores != 1 && khz <= cap_khz && khz >= prev) {
++					osm_off[c] = i;
++					prev = khz;
++				}
++			}
++		}
++		osm_ready = true;
+ 		__asm__ volatile("dmb oshst" ::: "memory");
+ 		*(volatile uint32_t *)(base + OSM_DESIRED) = best;
+ 		__asm__ volatile("dsb osh" ::: "memory");
+@@ -89,4 +112,26 @@ sweet_cpufreq_init(void)
+ 		    osm_clusters[c].name, cur, best, best_khz / 1000, osm_rd(base, OSM_DESIRED));
+ 	}
+ }
++/*
++ * Display on/off (SweetFramebuffer.cpp, RequestPowerChange): full speed while the screen is on, low while it is
++ * off. Nothing else scales the clocks, so without this a locked phone ran every core at its top all night.
++ * Boot-arg sweetcpufreq=0 (clusters left as ABL set them) also leaves this alone.
++ */
++void
++sweet_cpufreq_screen(int on)
++{
++	if (!osm_ready) {
++		return;
++	}
++	for (unsigned c = 0; c < sizeof(osm_clusters) / sizeof(osm_clusters[0]); ++c) {
++		if (!osm_base[c]) {
++			continue;
++		}
++		__asm__ volatile("dmb oshst" ::: "memory");
++		*(volatile uint32_t *)(osm_base[c] + OSM_DESIRED) = on ? osm_on[c] : osm_off[c];
++		__asm__ volatile("dsb osh" ::: "memory");
++	}
++	printf("SWEET CPUFREQ: screen %s: pwrcl index %u, perfcl index %u\n", on ? "on" : "off",
++	    on ? osm_on[0] : osm_off[0], on ? osm_on[1] : osm_off[1]);
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index ae06974..79ea02e 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -91,7 +91,7 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	bool wled = sid == 5 && (peripheral == 0xd8 || peripheral == 0xd9);
+ 	if (!sp_ready || !out || addr > 0xffffu || (!wled && (sid != 0 ||
+ 	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48)))) {
++	    peripheral != 0x13 && peripheral != 0x48 && peripheral != 0x60)))) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index dda93b6..6f3c550 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -54,6 +54,7 @@ extern int sweet_display_fit_x, sweet_display_fit_y, sweet_display_fit_w, sweet_
+ extern "C" int sweet_spmi_init(void);   /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+ extern "C" int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val);
++extern "C" void sweet_cpufreq_screen(int on);   /* bsd/dev/sweet_cpufreq.c */
+ 
+ /*
+  * surya is an LCD: black pixels still glow, so display off must also stop the backlight.
+@@ -798,6 +799,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			if (!PE_parse_boot_argn("sweetbl", &bl, sizeof(bl)) || bl) {
+ 				sweet_backlight(!off);
+ 			}
++			sweet_cpufreq_screen(!off);
+ 		}
+ 		break;
+ 	case kSweetFBSwapWait:
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index f55a538..6420f49 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -18,11 +18,73 @@ public:
+ 	void processTopLevel(IORegistryEntry *root) APPLE_KEXT_OVERRIDE;
+ 	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
+ 	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
++	long getGMTTimeOfDay(void) APPLE_KEXT_OVERRIDE;
++	void setGMTTimeOfDay(long secs) APPLE_KEXT_OVERRIDE;
+ };
+ 
+ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+ 
+ extern "C" void sweet_poke_start(void);
++
++/*
++ * Time of day (from ios-flame 0099, MIT): the PM6150 RTC (SPMI SID 0, peripheral 0x6000) counts seconds from
++ * whenever it was last set; HLOS cannot write it (surya DT qcom,qpnp-rtc-write = 0), Android keeps an offset.
++ * Here the offset is boot-arg sweetrtcoff (seconds; computed on the PC when the image is made). Without a time
++ * of day every boot started in 1970: daemons' history got 1969 dates (coreduetd/dasd then queried 57 years in a
++ * loop) and every boot had the same boottime. Published as the IORTC resource, which IOKitInitializeTime
++ * waits up to 30 s for.
++ */
++#include "../../../bsd/dev/sweet_spmi.h"
++
++#define PM6150_RTC_CTRL         0x6046
++#define PM6150_RTC_RDATA0       0x6048
++
++static int
++sweet_rtc_read(uint32_t *secs)
++{
++	uint8_t b[4], again;
++	if (sweet_spmi_init() != 0) {
++		return -1;
++	}
++	for (int tries = 0; tries < 3; tries++) {
++		for (unsigned i = 0; i < 4; i++) {
++			if (sweet_spmi_read(0, PM6150_RTC_RDATA0 + i, &b[i]) != 0) {
++				return -1;
++			}
++		}
++		/* the low byte rolled over between the reads: read again (rtc-pm8xxx does the same) */
++		if (sweet_spmi_read(0, PM6150_RTC_RDATA0, &again) != 0) {
++			return -1;
++		}
++		if (again >= b[0]) {
++			*secs = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
++			return 0;
++		}
++	}
++	return -1;
++}
++
++long
++SweetPlatformExpert::getGMTTimeOfDay(void)
++{
++	uint32_t rtc = 0;
++	uint64_t off = 0;
++	if (sweet_rtc_read(&rtc) != 0) {
++		return 0;
++	}
++	(void)PE_parse_boot_argn("sweetrtcoff", &off, sizeof(off));
++	return (long)((uint64_t)rtc + off);
++}
++
++void
++SweetPlatformExpert::setGMTTimeOfDay(long secs)
++{
++	uint32_t rtc = 0;
++	if (sweet_rtc_read(&rtc) == 0) {
++		/* the offset to use as sweetrtcoff from now on */
++		IOLog("SWEET RTC: time set to %ld (RTC %u): sweetrtcoff=%ld\n", secs, rtc, secs - (long)rtc);
++	}
++}
+ /* surya: no sweet_log_mirror_start(): flame's 0x1fe000000 mirror is past the end of RAM. */
+ 
+ bool
+@@ -33,6 +95,16 @@ SweetPlatformExpert::start(IOService *provider)
+ 		return false;
+ 	}
+ 	sweet_poke_start();             /* register scripts: bsd/dev/sweet_poke.c */
++	{
++		uint32_t rtc = 0;
++		uint8_t ctrl = 0;
++		if (sweet_rtc_read(&rtc) == 0 && sweet_spmi_read(0, PM6150_RTC_CTRL, &ctrl) == 0) {
++			IOLog("SWEET RTC: PM6150 RTC %u s (ctrl %02x), time of day %ld\n", rtc, ctrl, getGMTTimeOfDay());
++			publishResource("IORTC", this);
++		} else {
++			IOLog("SWEET RTC: PM6150 RTC not readable; no time of day\n");
++		}
++	}
+ 	registerService();
+ 	IOLog("SWEET: platform expert registered\n");
+ 	return true;
