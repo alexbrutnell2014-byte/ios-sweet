@@ -1,0 +1,104 @@
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index f8bd9b0..fd7b56c 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -12,6 +12,8 @@
+ #include <IOKit/pwr_mgt/IOPMPowerSource.h>
+ #include <libkern/c++/OSCollectionIterator.h>
+ #include <pexpert/pexpert.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+@@ -39,6 +41,9 @@ private:
+ 	static bool readWord(unsigned address, uint16_t *value);
+ 	static unsigned estimatePercent(unsigned mv);
+ 	void configureCharger(bool external);
++	unsigned gaugePercent(unsigned mv, int ma, bool currentValid, bool external, bool full);
++	int32_t fSocMilli;		/* gauge state, 0..100000 (thousandths of a percent); < 0 = not started */
++	uint64_t fSocAbs;		/* mach_absolute_time of the last gauge step */
+ 	uint8_t fChargerApsd;		/* APSD result the charger was last configured for (0 = none) */
+ };
+ OSDefineMetaClassAndStructors(SweetBattery, IOPMPowerSource);
+@@ -55,6 +60,8 @@ SweetBattery::init(OSDictionary *dictionary)
+ 	fLoop = NULL;
+ 	fTimer = NULL;
+ 	fTimerAdded = fRunning = fReal = false;
++	fSocMilli = -1;
++	fSocAbs = 0;
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+ 		if (!it) {
+@@ -206,6 +213,62 @@ SweetBattery::estimatePercent(unsigned mv)
+ 	return 100;
+ }
+ 
++/*
++ * surya: a small fuel gauge. The PM6150 QG only measures; Linux computes the state of charge itself from a
++ * battery profile. A voltage-only estimate jumped (11% -> 66% in 30 s on a fast charger: the charging current
++ * lifts the terminal voltage). Here: the starting point from the voltage corrected for I*R (resting voltage),
++ * then coulomb counting with the measured current over the 5160 mAh cell (surya), pulled gently toward the
++ * corrected voltage while the current is small; shown as rising only while charging and falling only on
++ * battery. Full (charger done) is 100%.
++ */
++#define SWEET_BATT_MAH          5160
++#define SWEET_BATT_MOHM         120	/* cell + path resistance for the I*R correction */
++
++unsigned
++SweetBattery::gaugePercent(unsigned mv, int ma, bool currentValid, bool external, bool full)
++{
++	/* ma > 0: into the battery (charging) */
++	int ocv = (int)mv - (currentValid ? ma * SWEET_BATT_MOHM / 1000 : 0);
++	int32_t target = (int32_t)estimatePercent(ocv > 0 ? (unsigned)ocv : 0) * 1000;
++	uint64_t now = mach_absolute_time();
++	if (full) {
++		fSocMilli = 100000;
++		fSocAbs = now;
++		return 100;
++	}
++	if (fSocMilli < 0 || fSocAbs == 0) {
++		fSocMilli = target;
++		fSocAbs = now;
++		return (unsigned)((fSocMilli + 500) / 1000);
++	}
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(now - fSocAbs, &ns);
++	fSocAbs = now;
++	int32_t before = fSocMilli;
++	int32_t next = fSocMilli;
++	if (currentValid) {
++		/* coulomb count: mA * s / (mAh * 3600) * 100% */
++		int64_t delta = (int64_t)ma * (int64_t)(ns / 1000000ULL) * 100000LL / ((int64_t)SWEET_BATT_MAH * 3600000LL);
++		next += (int32_t)delta;
++	}
++	if (!currentValid || (ma > -300 && ma < 300)) {
++		next += (target - next) / 8;	/* near rest: drift toward the corrected voltage */
++	}
++	/* on the charger the shown level only rises; on battery it only falls */
++	if (external && next < before) {
++		next = before;
++	} else if (!external && next > before) {
++		next = before;
++	}
++	if (next < 0) {
++		next = 0;
++	} else if (next > 99000 && !full) {
++		next = 99000;			/* 100% only when the charger says done */
++	}
++	fSocMilli = next;
++	return (unsigned)((fSocMilli + 500) / 1000);
++}
++
+ void
+ SweetBattery::poll(void)
+ {
+@@ -262,7 +325,7 @@ SweetBattery::poll(void)
+ 		/* Linux: negative=charging; IOPMPowerSource: positive=charging, mA. */
+ 		ma = (int)(-((int64_t)signedRaw * (subtype == 3 ? 152588 : 305176)) / 1000000);
+ 	}
+-	publish(full ? 100 : estimatePercent(mv), mv, ma, external, capable,
++	publish(gaugePercent(mv, ma, currentValid, external, full), mv, ma, external, capable,
+ 	    charging, full, true, currentValid);
+ }
+ 
