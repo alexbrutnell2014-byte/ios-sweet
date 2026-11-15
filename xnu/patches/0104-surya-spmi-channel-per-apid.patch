@@ -1,0 +1,22 @@
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index b77b6db..15a801a 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -145,10 +145,14 @@ sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val)
+ 		IOLockUnlock(sp_lock);
+ 		return -1;
+ 	}
+-	static vm_offset_t chan[2];
+-	vm_offset_t ch = chan[peripheral & 1];
++	/*
++	 * One mapping per APID. (It was two slots keyed by peripheral & 1: once the charger's CHGR (0x10) took
++	 * slot 0, the WLED's 0xd8 writes went to CHGR + 0x46 instead - the backlight stopped turning off.)
++	 */
++	static vm_offset_t chan[512];
++	vm_offset_t ch = chan[apid];
+ 	if (!ch) {
+-		ch = chan[peripheral & 1] = ml_io_map(SP_CHNLS_PA + 0x10000u * apid, 0x1000);
++		ch = chan[apid] = ml_io_map(SP_CHNLS_PA + 0x10000u * apid, 0x1000);
+ 		if (!ch) {
+ 			IOLockUnlock(sp_lock);
+ 			return -1;
