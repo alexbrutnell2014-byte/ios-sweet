@@ -128,20 +128,29 @@ static void run(const char *name)
  * holds the current boot.
  */
 #include <sys/sysctl.h>
+/* libproc (libsystem_kernel): the kernel message buffer, as macOS dmesg reads it; kern.msgbuf is only its size */
+extern int proc_kmsgbuf(void *buffer, uint32_t buffersize);
+
 static void save_msgbuf(void)
 {
 	sleep(90);
-	size_t len = 0;
-	if (sysctlbyname("kern.msgbuf", NULL, &len, NULL, 0) != 0 || len == 0)
+	int size = 0;
+	size_t sl = sizeof(size);
+	if (sysctlbyname("kern.msgbuf", &size, &sl, NULL, 0) != 0 || size <= 0)
+		size = 512 * 1024;
+	char *buf = malloc((size_t)size + 1);
+	if (!buf)
 		return;
-	char *buf = malloc(len + 1);
-	if (!buf || sysctlbyname("kern.msgbuf", buf, &len, NULL, 0) != 0)
+	int n = proc_kmsgbuf(buf, (uint32_t)size);
+	if (n <= 0) {
+		free(buf);
 		return;
+	}
 	rename("/var/local/dmesg-boot.txt", "/var/local/dmesg-boot.prev.txt");
 	FILE *f = fopen("/var/local/dmesg-boot.txt", "w");
 	if (f) {
 		/* the buffer is a ring with NUL padding: write every non-NUL byte */
-		for (size_t i = 0; i < len; i++)
+		for (int i = 0; i < n; i++)
 			if (buf[i])
 				fputc(buf[i], f);
 		fclose(f);
