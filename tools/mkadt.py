@@ -74,7 +74,7 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, nvt_fw=None, gpu_fw=None, display_scale=3):
+def build(seed=None, qemu=False, highmem=False, nvt_fw=None, gpu_fw=None, display_scale=3, canvas=(1125, 2436)):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     # Carve the panic log off the top so the kernel never allocates over it.
@@ -200,8 +200,8 @@ def build(seed=None, qemu=False, highmem=False, nvt_fw=None, gpu_fw=None, displa
             ph(),
             ('device_type', cstr('display-subsystem')),
             ('compatible', cstr('sweet,display')),
-            ('canvas-width', u32(1125)),
-            ('canvas-height', u32(2436)),
+            ('canvas-width', u32(canvas[0])),
+            ('canvas-height', u32(canvas[1])),
         ])])
 
     fbcon = node('sweet-fbcon', [
@@ -267,8 +267,12 @@ if __name__ == '__main__':
     gpu_fw = next((a.split('=', 1)[1] for a in sys.argv if a.startswith('--gpu-fw=')), None)
     # --display-scale=N: MobileGestalt's screen scale (3 = iPhone X @3x; 2 with the kernel's sweetfb_lw/lh = 750x1624)
     display_scale = int(next((a.split('=', 1)[1] for a in sys.argv if a.startswith('--display-scale=')), '3'))
+    # --canvas=WxH: the display canvas IOMobileFramebuffer.framework reads from /arm-io/disp0; must match the
+    # kernel's sweetfb_lw/lh (Core Animation otherwise renders targets at the old size and leaks them)
+    cv = next((a.split('=', 1)[1] for a in sys.argv if a.startswith('--canvas=')), '1125x2436')
+    canvas = tuple(int(x) for x in cv.lower().split('x'))
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, nvt_fw=nvt_fw, gpu_fw=gpu_fw,
-                 display_scale=display_scale)
+                 display_scale=display_scale, canvas=canvas)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
