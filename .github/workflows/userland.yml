@@ -22,10 +22,13 @@ jobs:
         run: sh phone/wifi-surya/build.sh
       - name: tools (surya)
         run: sh phone/tools-surya/build.sh
+      - name: test app
+        run: sh phone/testapp/build.sh
       - uses: actions/upload-artifact@v4
         with:
           name: userland
           path: |
             phone/wifi-surya/out/
             phone/tools-surya/out/
+            phone/testapp/out/SweetHello.ipa
           retention-days: 30
