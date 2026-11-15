@@ -7,6 +7,8 @@
  *   lsreg -p APPEX...        register plugins (.appex) by themselves
  *   lsreg -i APP_PATH...     register a third-party (User) app like uicache/TrollStore: creates its data
  *                            container with MobileContainerManager, then registerApplicationDictionary:
+ *                            Type System like TrollStore (SpringBoard refuses ad-hoc User apps: "profile has
+ *                            not been explicitly trusted"); LSREG_TYPE=User to override.
  * Signed with com.apple.migrationpluginwrapper's entitlements.
  */
 #import <Foundation/Foundation.h>
@@ -78,7 +80,8 @@ static int register_user_app(LSApplicationWorkspace *ws, NSString *path)
 	}
 
 	NSDictionary *d = @{
-		@"ApplicationType": @"User",
+		@"ApplicationType": getenv("LSREG_TYPE") ? @(getenv("LSREG_TYPE")) : @"System",
+		@"SignatureVersion": @132352,
 		@"CFBundleIdentifier": bid,
 		@"CodeInfoIdentifier": bid,
 		@"CompatibilityState": @0,
