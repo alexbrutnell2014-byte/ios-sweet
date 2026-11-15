@@ -260,6 +260,7 @@ def resign_app(app):
                         ident = bin_info.get('CFBundleIdentifier', ident)
                         ih, rh = bundle_hashes(owner)
             arm64, notes = sign_file(path, ident, ih, rh)
+            os.chmod(path, os.stat(path).st_mode | 0o755)  # every Mach-O executable, whatever the IPA said
             if path == main_exe:
                 main_arm64 = arm64
             count += 1
@@ -297,6 +298,13 @@ def install(src):
                     if m.startswith('/') or '..' in m.split('/'):
                         raise SignError('bad path in IPA: %s' % m)
                 z.extractall(tmp)
+                # zipfile drops Unix modes; restore them (an app binary without +x fails in xpcproxy: launchd
+                # error 111 "Invalid or missing Program").
+                for zi in z.infolist():
+                    mode = (zi.external_attr >> 16) & 0o7777
+                    p = os.path.join(tmp, zi.filename)
+                    if mode and not zi.is_dir() and os.path.isfile(p):
+                        os.chmod(p, mode)
             pl = os.path.join(tmp, 'Payload')
             apps = [d for d in os.listdir(pl) if d.endswith('.app')] if os.path.isdir(pl) else []
             if len(apps) != 1:
