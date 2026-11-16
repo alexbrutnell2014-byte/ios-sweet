@@ -660,6 +660,8 @@ static int rx_one(void)
 		for (uint32_t i = 0; i < p2; i++) {
 			uint32_t pr[2];
 			g_peek(pr, 8 + i * 8, 8);
+			if (c && c->lcid == 2)
+				LOG("glink: < INTENT on \"%s\": iid %u size %u", c->name, pr[1], pr[0]);
 			if (c && c->nrint < MAX_RINT) {
 				c->rint[c->nrint].size = pr[0];
 				c->rint[c->nrint].iid = pr[1];
@@ -674,6 +676,8 @@ static int rx_one(void)
 	case G_RX_DONE_W_REUSE:
 		if ((c = by_rcid(p1)) == NULL)
 			break;
+		if (c->lcid == 2)
+			LOG("glink: < RX_DONE%s on \"%s\" for iid %u", cmd == G_RX_DONE ? "" : "_W_REUSE", c->name, p2);
 		for (int i = 0; i < c->nrint; i++)
 			if (c->rint[i].iid == p2) {
 				if (cmd == G_RX_DONE)
@@ -781,6 +785,9 @@ static int ch_send(struct chan *c, const void *data, uint32_t len)
 		poll_for(1);
 	}
 	c->rint[best].busy = 1;
+	if (c->lcid == 2)
+		LOG("glink: > %u bytes on \"%s\" in its intent %u (size %u; %d intents)", len, c->name, c->rint[best].iid,
+		    c->rint[best].size, c->nrint);
 	const uint8_t *d = data;
 	for (uint32_t off = 0; off < len;) {
 		uint32_t chunk = len - off > 8192 ? 8192 : len - off;
@@ -1146,6 +1153,8 @@ static int cmd(const char *what, uint8_t svc, uint16_t port, uint32_t opcode, co
 		while (now_ms() < end && !apr_ans.got)
 			poll_for(10);
 		LOG("tone: %s: %s (adsp state %x)", what, apr_ans.got ? "a LATE answer came" : "still nothing", adsp_state);
+		LOG("tone: fifo: tx head %u tail %u (of %u), rx head %u tail %u (of %u)", rd32(TX_HEAD), rd32(TX_TAIL), g_txlen,
+		    rd32(RX_HEAD), rd32(RX_TAIL), g_rxlen);
 		return -1;
 	}
 	if (apr_ans.opcode == APR_BASIC_RSP && apr_ans.w[0] == opcode) {
