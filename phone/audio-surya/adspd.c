@@ -1340,9 +1340,13 @@ static int tone(unsigned secs)
 	uint32_t copp = 0;
 	uint16_t start[2] = { AFE_PORT, 0 };
 
+	/* ADSPD_STEPS=N stops after step N: 1 the SMMU bank and ASM's map, 2 the port's settings, 3 the bit clock,
+	 * 4 the port's start; default all (the stream and the tone) */
+	const char *e = getenv("ADSPD_STEPS");
+	unsigned steps = e ? (unsigned)atoi(e) : 99;
 	if (secs > 10)
 		secs = 10;
-	pins_on();
+	LOG("tone: up to step %u", steps);
 	if (smmu_audio_identity())
 		goto out;
 	/*
@@ -1363,6 +1367,8 @@ static int tone(unsigned secs)
 		map_handle = apr_ans.w[0];
 		LOG("tone: %u KB at %#llx are the DSP's handle %#x", BUF_BYTES / 1024, (unsigned long long)a, map_handle);
 	}
+	if (steps < 2)
+		goto out;
 	/* the port */
 	{
 		struct { uint32_t version; uint16_t bits, lines, stereo, ws_src; uint32_t rate; uint16_t format, reserved; }
@@ -1371,8 +1377,11 @@ static int tone(unsigned secs)
 				   AFE_PARAM_ID_I2S_CONFIG, &i2s, sizeof(i2s)))
 			goto out;
 	}
+	if (steps < 3)
+		goto out;
+	pins_on();
 	clock_on = afe_clock(1) == 0;
-	if (!clock_on)
+	if (!clock_on || steps < 4)
 		goto out;
 	port_on = cmd("port 0x1004, start", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_START, start, sizeof(start), 0) == 0;
 	if (!port_on)
