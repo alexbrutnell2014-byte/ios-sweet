@@ -1,0 +1,39 @@
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index e04004956..e5f507976 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -1972,6 +1972,14 @@ impl Device {
+             "the buffer's bytes were detached from their pages (detach_backing) as the texture \
+              was made"
+                 .to_owned()
++        } else if sweet_render_shadow(descriptor, usage) {
++            // ios-sweet (Turnip on the Adreno 618): a large render target over a buffer (CA's
++            // framebuffer, an IOSurface) renders through its shadow, an optimal image Turnip
++            // compresses (UBWC), copied back at the end of each encoder that writes it: blending
++            // into it runs 2.5x faster than into the linear image (vktest bench, sysmem).
++            "ios-sweet: a large render target renders through a compressed shadow \
++             (M2V_SWEET_RENDER_SHADOW_PX)"
++                .to_owned()
+         } else if dma_buf {
+             // Over dma-buf pages, one image of the two plans at most, its pages' source called
+             // once (`dma_buf.rs`).
+@@ -5802,3 +5810,19 @@ struct HostCopy {
+     /// (`two_planes.rs`).
+     planes: bool,
+ }
++
++/// ios-sweet: whether a texture over a buffer of `descriptor` and `usage` renders through its
++/// shadow rather than a linear image aliasing the bytes: a render target of at least
++/// `M2V_SWEET_RENDER_SHADOW_PX` texels (default 1,000,000; 0 turns it off).
++fn sweet_render_shadow(descriptor: &TextureDescriptor, usage: TextureUsage) -> bool {
++    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
++    let min = *MIN.get_or_init(|| {
++        std::env::var("M2V_SWEET_RENDER_SHADOW_PX")
++            .ok()
++            .and_then(|v| v.trim().parse().ok())
++            .unwrap_or(1_000_000)
++    });
++    min != 0
++        && usage.contains(TextureUsage::RENDER_TARGET)
++        && descriptor.width.saturating_mul(descriptor.height) >= min
++}
