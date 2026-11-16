@@ -1880,11 +1880,7 @@ static int listener_start(void)
 	int32_t r = frpc_call("adsp_listener init2", 3, SCALARS(3, 0, 0), 0, NULL, NULL, 0, NULL, NULL);
 	if (r)
 		return -1;
-	lsn_on = 1;
-	if (lsn_next(0, -1, NULL, 0)) {
-		lsn_on = 0;
-		return -1;
-	}
+	/* (with next2 sent first, this open was never answered: the open goes first, next2 before the register) */
 	const char name[] = "adsp_default_listener";
 	uint32_t prim_in[2] = { sizeof(name), 128 }, prim_out[2] = { 0, 0 };
 	char dlerr[128] = "";
@@ -1897,6 +1893,11 @@ static int listener_start(void)
 	    dlerr);
 	if (r || prim_out[1])
 		return -1;
+	lsn_on = 1;
+	if (lsn_next(0, -1, NULL, 0)) {
+		lsn_on = 0;
+		return -1;
+	}
 	r = frpc_call("adsp_default_listener register", prim_out[0], SCALARS(0, 0, 0), 0, NULL, NULL, 0, NULL, NULL);
 	return r ? -1 : 0;
 }
