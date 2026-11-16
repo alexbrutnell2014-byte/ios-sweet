@@ -1,0 +1,52 @@
+diff --git a/src/freedreno/vulkan/tu_pipeline.cc b/src/freedreno/vulkan/tu_pipeline.cc
+index 718c0b2..a97afc5 100644
+--- a/src/freedreno/vulkan/tu_pipeline.cc
++++ b/src/freedreno/vulkan/tu_pipeline.cc
+@@ -3812,9 +3812,17 @@ tu6_emit_prim_mode_sysmem(struct tu_cs *cs,
+     * setting the SINGLE_PRIM_MODE field to the same value that the blob does
+     * for advanced_blend in sysmem mode if a feedback loop is detected.
+     */
++   /* sweet: metal2vulkan (Metal framebuffer fetch through input attachments) makes every color
++    * attachment of a pass an input attachment of its subpass, with rasterization-order access on every
++    * pipeline, because a pass cannot foresee which draws fetch. Turnip then put every draw of Core
++    * Animation in this mode (one primitive at a time, ~150 us a draw: 11-35 fps scrolling). Only a
++    * fragment shader that reads an input attachment needs it: one that does not reads nothing of the
++    * attachment it writes, so there is no feedback for the flush to order.
++    */
++   bool fs_reads = fs && (fs->fs.reads_input_attachments || fs->fs.dynamic_input_attachments_used);
+    enum a6xx_single_prim_mode sysmem_prim_mode =
+-      (raster_order_attachment_access || feedback_loops ||
+-       fs->fs.dynamic_input_attachments_used) ?
++      fs_reads && (raster_order_attachment_access || feedback_loops ||
++                   fs->fs.dynamic_input_attachments_used) ?
+       FLUSH_PER_OVERLAP_AND_OVERWRITE : NO_FLUSH;
+ 
+    if (sysmem_prim_mode == FLUSH_PER_OVERLAP_AND_OVERWRITE)
+diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
+index d99d55c..f820197 100644
+--- a/src/freedreno/vulkan/tu_shader.cc
++++ b/src/freedreno/vulkan/tu_shader.cc
+@@ -560,6 +560,7 @@ build_bindless(struct tu_device *dev, nir_builder *b,
+       /* Record which input attachments are used for tracking feedback loops */
+       if (dynamic_renderpass)
+          shader->fs.dynamic_input_attachments_used |= (1u << (idx / 2));
++      shader->fs.reads_input_attachments = true;
+ 
+       BITSET_SET_RANGE_INSIDE_WORD(b->shader->info.textures_used, idx, (idx + bind_layout->array_size * 2) - 1);
+ 
+diff --git a/src/freedreno/vulkan/tu_shader.h b/src/freedreno/vulkan/tu_shader.h
+index 1cd0e89..724b50c 100644
+--- a/src/freedreno/vulkan/tu_shader.h
++++ b/src/freedreno/vulkan/tu_shader.h
+@@ -108,6 +108,11 @@ struct tu_shader
+ 
+          uint16_t dynamic_input_attachments_used;
+ 
++         /* sweet: the shader reads an input attachment (with or without a dynamic render pass): only then
++          * does a feedback loop or rasterization-order access need single-primitive mode (tu_pipeline.cc).
++          */
++         bool reads_input_attachments;
++
+          struct {
+             uint32_t status;
+             bool force_late_z;
