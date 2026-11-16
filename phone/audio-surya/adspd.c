@@ -1591,10 +1591,12 @@ static uint32_t frpc_build(uint64_t pa, uint32_t cap, int nin, const void *const
 	return off;
 }
 
+static unsigned frpc_pd = 1;	/* the PD of this session's invokes: 0 the root (attached), 1 a static PD (audiopd) */
+
 static int frpc_send(int id, int tid, uint32_t handle, uint32_t sc, uint64_t pa, uint32_t pkt)
 {
 	struct { int32_t client_id, tid; uint64_t ctx; uint32_t handle, sc; uint64_t addr, size; } __attribute__((packed)) m = {
-		(int32_t)getpid(), tid, ((uint64_t)id << 4) | 1 /* USER_PD */, handle, sc, FRPC_ADDR(pa), (pkt + 4095) & ~4095u };
+		(int32_t)getpid(), tid, ((uint64_t)id << 4) | frpc_pd, handle, sc, FRPC_ADDR(pa), (pkt + 4095) & ~4095u };
 	frpc_rsp[id].got = 0;
 	return ch_send(&chans[2], &m, sizeof(m));
 }
@@ -1867,10 +1869,20 @@ static int32_t lsn_dispatch(uint32_t handle, uint32_t sc, const uint8_t *req, ui
 	else if (handle == H_APPS_STD)
 		r = mod_apps_std(m, in, inl, nin, out, outl, nout);
 	else if (handle == H_MSGD) {
-		char a[200] = "";
-		if (nin >= 2) {
-			str_arg(a, sizeof(a), in[1], inl[1]);
-			LOG("dsp log: %s", a);
+		/* adspmsgd_apps.log(octetSeq): LogNode { u32 level; u16 line, thread; char str[218]; char file[30]; } x n */
+		static const char *const lv[] = { "low", "med", "HIGH", "ERROR", "FATAL" };
+		for (uint32_t o = 0; nin >= 2 && o + 256 <= inl[1]; o += 256) {
+			const uint8_t *nd = in[1] + o;
+			uint32_t level;
+			uint16_t line, thread;
+			char str[219], file[31];
+			memcpy(&level, nd, 4);
+			memcpy(&line, nd + 4, 2);
+			memcpy(&thread, nd + 6, 2);
+			str_arg(str, sizeof(str), nd + 8, 218);
+			str_arg(file, sizeof(file), nd + 226, 30);
+			str[strcspn(str, "\n")] = 0;
+			LOG("dsp %s %s:%u [%x] %s", level < 5 ? lv[level] : "?", file, line, thread, str);
 		}
 		r = 0;
 	} else {
@@ -1968,6 +1980,60 @@ static int listener_start(void)
 	return r ? -1 : 0;
 }
 
+/*
+ * The root PD's log (ADSPD_ROOTLOG=1): attach to the guest OS (FASTRPC_RMID_INIT_ATTACH, a kernel invoke on the init
+ * handle with our client id, as Linux fastrpc_init_attach), run the listener there, open its "adspmsgd_adsp" and
+ * init2 it: the root PD then sends its log lines through the listener to our adspmsgd_apps (quic/fastrpc adspmsgd).
+ */
+static int root_log_start(void)
+{
+	struct chan *c = &chans[2];
+	uint64_t end = now_ms() + 2000;
+	while (now_ms() < end && !(c->open_acked && c->remote_open))
+		poll_for(10);
+	if (!(c->open_acked && c->remote_open) || smmu_identity(1, FRPC_SID))
+		return -1;
+	frpc_pd = 0;
+	if (!lsn_req) {
+		lsn_req = malloc(LSN_IN_CAP);
+		lsn_resp = malloc(LSN_SIZE);
+	}
+	int32_t client = (int32_t)getpid();
+	const void *ind[1] = { &client };
+	uint32_t inl[1] = { 4 }, outoff[1];
+	uint32_t pkt = frpc_build(FRPC_BUF_PA, 0x10000, 1, ind, inl, 0, NULL, outoff);
+	struct { int32_t client_id, tid; uint64_t ctx; uint32_t handle, sc; uint64_t addr, size; } __attribute__((packed)) m = {
+		0 /* a kernel invoke */, client, (1u << 4) | 0 /* ROOT_PD */, 1 /* FASTRPC_INIT_HANDLE */,
+		SCALARS(0 /* INIT_ATTACH */, 1, 0), FRPC_ADDR(FRPC_BUF_PA), (pkt + 4095) & ~4095u };
+	frpc_rsp[1].got = 0;
+	if (ch_send(c, &m, sizeof(m)))
+		return -1;
+	end = now_ms() + 3000;
+	while (now_ms() < end && !frpc_rsp[1].got)
+		poll_for(5);
+	LOG("rootlog: attach to the root PD -> %s %d", frpc_rsp[1].got ? "retval" : "NO ANSWER", frpc_rsp[1].retval);
+	if (!frpc_rsp[1].got || frpc_rsp[1].retval)
+		return -1;
+	if (frpc_call("adsp_listener init2 (root)", 3, SCALARS(3, 0, 0), 0, NULL, NULL, 0, NULL, NULL))
+		return -1;
+	lsn_on = 1;
+	if (lsn_next(0, -1, NULL, 0))
+		return -1;
+	const char name[] = "adspmsgd_adsp";
+	uint32_t prim_in[2] = { sizeof(name), 128 }, prim_out[2] = { 0, 0 };
+	char dlerr[128] = "";
+	const void *ind2[2] = { prim_in, name };
+	uint32_t inl2[2] = { 8, sizeof(name) }, outl[2] = { 8, sizeof(dlerr) };
+	void *outp[2] = { prim_out, dlerr };
+	int32_t r = frpc_call("remotectl open \"adspmsgd_adsp\" (root)", 0, SCALARS(0, 2, 2), 2, ind2, inl2, 2, outl, outp);
+	dlerr[sizeof(dlerr) - 1] = 0;
+	LOG("rootlog: adspmsgd_adsp handle %#x nErr %#x %s", prim_out[0], prim_out[1], dlerr);
+	if (r || prim_out[1])
+		return -1;
+	r = frpc_call("adspmsgd_adsp init2 (root)", prim_out[0], SCALARS(1 /* init2 */, 0, 0), 0, NULL, NULL, 0, NULL, NULL);
+	return r ? -1 : 0;
+}
+
 /* 1 kHz at 48 kHz, -20 dBFS: one cycle */
 static const int16_t tone_cycle[48] = {
 	0, 428, 848, 1254, 1638, 1995, 2317, 2600, 2838, 3028, 3165, 3249,
@@ -2007,6 +2073,13 @@ static int tone(unsigned secs)
 	LOG("tone: up to step %u", steps);
 	{
 		const char *pe = getenv("ADSPD_AUDIOPD");
+		const char *rl = getenv("ADSPD_ROOTLOG");
+		if (rl && atoi(rl)) {
+			LOG("tone: root PD log %s", root_log_start() ? "NOT started" : "started");
+			poll_for(3000);
+			LOG("tone: the DSP made %u calls to us so far", n_requests);
+			pe = "0";
+		}
 		srvreg_query("msm/adsp/root_pd");
 		poll_for(200);
 		srvreg_query("msm/adsp/audio_pd");
