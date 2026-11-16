@@ -1,0 +1,102 @@
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index 8e29586..327c108 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -5009,6 +5009,49 @@ choose_next_pset(
+ 	return nset;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * surya (SM7150): six Cortex-A55 (cpus 0-5, 1.8 GHz) and two Cortex-A76 (cpus 6-7, 2.3 GHz, about twice
++ * the work per clock) in one SMP cluster: the ADT describes no AMP, and every idle pick below takes the
++ * lowest-numbered idle CPU, so a thread only ever got an A76 when all six A55s were busy. backboardd's
++ * frame encode then ran on an A55 (30-38 ms a frame; scrolling at 11-18 fps). Threads at or above
++ * sweetfastpri (default 46, the user-interactive band: apps' main threads, the render server) now take
++ * an idle A76 first; the others an idle A55 first. Boot-arg sweetfastcpus=MASK (default 0xc0, 0 = off).
++ */
++static cpumap_t sweet_fast_map = 0xc0;
++static int sweet_fast_pri = 46;
++static bool sweet_fast_inited;
++
++static inline cpumap_t
++sweet_fast_cpus(void)
++{
++	if (__improbable(!sweet_fast_inited)) {
++		uint32_t m;
++		int p;
++		if (PE_parse_boot_argn("sweetfastcpus", &m, sizeof(m))) {
++			sweet_fast_map = m;
++		}
++		if (PE_parse_boot_argn("sweetfastpri", &p, sizeof(p))) {
++			sweet_fast_pri = p;
++		}
++		sweet_fast_inited = true;
++	}
++	return sweet_fast_map;
++}
++
++/* An idle fast CPU for a high-priority thread, else PROCESSOR_NULL. */
++static inline processor_t
++sweet_idle_fast_processor(processor_set_t pset, thread_t thread)
++{
++	cpumap_t fast = sweet_fast_cpus();
++	if (!fast || thread->sched_pri < sweet_fast_pri) {
++		return PROCESSOR_NULL;
++	}
++	int cpuid = lsb_first(pset->cpu_state_map[PROCESSOR_IDLE] & pset->primary_map & pset->recommended_bitmask & fast);
++	return cpuid >= 0 ? processor_array[cpuid] : PROCESSOR_NULL;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ /*
+  *	choose_processor:
+  *
+@@ -5083,6 +5126,15 @@ choose_processor(
+ 				 * idle processor. The platform layer had an opportunity to provide
+ 				 * the "least cost idle" processor above.
+ 				 */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++				if (!bit_test(sweet_fast_cpus(), processor->cpu_id)) {
++					processor_t fast = sweet_idle_fast_processor(pset, thread);
++					if (fast != PROCESSOR_NULL &&
++					    ((thread->sched_pri < BASEPRI_RTQUEUES) || processor_is_fast_track_candidate_for_realtime_thread(pset, fast))) {
++						return fast;
++					}
++				}
++#endif
+ 				if ((thread->sched_pri < BASEPRI_RTQUEUES) || processor_is_fast_track_candidate_for_realtime_thread(pset, processor)) {
+ 					return processor;
+ 				}
+@@ -5246,7 +5298,18 @@ no_available_cpus:
+ 		/* there shouldn't be a pending AST if the processor is idle */
+ 		assert((idle_primary_map & pset->pending_AST_URGENT_cpu_mask) == 0);
+ 
+-		int cpuid = lsb_first(idle_primary_map);
++		uint64_t idle_pick_map = idle_primary_map;
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		{
++			cpumap_t fast = sweet_fast_cpus();
++			if (fast && thread->sched_pri >= sweet_fast_pri && (idle_primary_map & fast)) {
++				idle_pick_map = idle_primary_map & fast;
++			} else if (fast && thread->sched_pri < sweet_fast_pri && (idle_primary_map & ~fast)) {
++				idle_pick_map = idle_primary_map & ~fast;	/* keep the A76s free for the ones above */
++			}
++		}
++#endif
++		int cpuid = lsb_first(idle_pick_map);
+ 		if (cpuid >= 0) {
+ 			processor = processor_array[cpuid];
+ 			return processor;
+@@ -8307,6 +8370,11 @@ try_again:
+ 	if (avoid_cpu0) {
+ 		primary_map = bit_ror64(primary_map, 1);
+ 	}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (!avoid_cpu0 && (primary_map & sweet_fast_cpus())) {
++		primary_map &= sweet_fast_cpus();	/* realtime threads: a free A76 first */
++	}
++#endif
+ 
+ 	int rotid = lsb_first(primary_map);
+ 	if (rotid >= 0) {
