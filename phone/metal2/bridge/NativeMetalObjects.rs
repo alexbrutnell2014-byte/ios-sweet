@@ -250,6 +250,30 @@ pub extern "C" fn nmb_device_work_stats(device: *const NmbDevice, out: *mut u64)
     })
 }
 
+/// The runtime's submission and upload counts into the caller's eight words (`WorkCounts`): internal submissions (each a host call
+/// waits for: a host copy through the GPU), host texel copies (no submission), images started on the host, uncached host images,
+/// staging submissions, queue submissions, command buffers submitted, commits handed off. Where a frame's GPU idles between submits.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_upload_stats(device: *const NmbDevice, out: *mut u64) -> bool {
+    guard(false, || {
+        if out.is_null() {
+            return Err("null stats".into());
+        }
+        // SAFETY: the header's eight words.
+        let out = unsafe { std::slice::from_raw_parts_mut(out, 8) };
+        let c = get(device)?.0.work_counts();
+        out[0] = c.internal_submissions;
+        out[1] = c.host_texel_copies;
+        out[2] = c.images_started_on_the_host;
+        out[3] = c.uncached_host_images;
+        out[4] = c.staging_submissions;
+        out[5] = c.queue_submissions;
+        out[6] = c.command_buffers_submitted;
+        out[7] = c.commits_handed_off;
+        Ok(true)
+    })
+}
+
 /// Separate artifact and driver-record counters, mirroring the C ABI.
 #[repr(C)]
 pub struct NmbShaderCacheStats {

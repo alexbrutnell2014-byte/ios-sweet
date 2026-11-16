@@ -1741,6 +1741,12 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   char warning[200];size_t n=nmb_last_warning(warning,sizeof warning);
   if(n){row("W %.86s",warning);if(n>86)row("Wb %.86s",warning+86);}
  }
+ // The runtime's submissions: internal ones are host copies through the GPU, each waited for (where the GPU idles between submits).
+ uint64_t up[8]={};
+ if(gDevice && nmb_device_upload_stats(gDevice,up))
+  row("U internal%llu hostcopy%llu hoststart%llu uncached%llu staging%llu | qsubmit%llu cbs%llu handoff%llu",(unsigned long long)up[0],
+   (unsigned long long)up[1],(unsigned long long)up[2],(unsigned long long)up[3],(unsigned long long)up[4],(unsigned long long)up[5],
+   (unsigned long long)up[6],(unsigned long long)up[7]);
  {
   std::lock_guard<std::mutex> lock(gProblemLock);
   char formats[160];native_bridge_metal_formats_locked(formats,sizeof formats);row("F %.86s",formats);
