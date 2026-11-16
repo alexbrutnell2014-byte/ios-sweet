@@ -846,6 +846,25 @@ static void scheduled(void *context);
    gPasses++;gPassPixels+=pixels;encodedWork.passes++;encodedWork.pixels+=pixels;
    uint64_t seen=gBiggestPass.load();while(pixels>seen && !gBiggestPass.compare_exchange_weak(seen,pixels)){}
    if(pixels>=2000000)gFullScreenPasses++;
+   // The first large passes, attachment by attachment: what a frame's full-screen pass renders into (each such
+   // pass shows two full-size Vulkan attachments, one cleared and not stored).
+   static std::atomic<unsigned> described{0};
+   if(pixels>=1000000 && described.load()<12) {
+    described++;
+    char line[600];int at=snprintf(line,sizeof line,"pass %llux%llu:",(unsigned long long)first.width,(unsigned long long)first.height);
+    for(unsigned i=0;i<8 && at<(int)sizeof line-80;i++) {
+     MTLRenderPassColorAttachmentDescriptor *c=d.colorAttachments[i];
+     if(!c.texture)continue;
+     id<MTLTexture> t=c.texture;
+     BOOL surface=[(id)t isKindOfClass:[NBTexture class]] && ((NBTexture *)t).surface!=nil;
+     at+=snprintf(line+at,sizeof line-at," c%u fmt%lu %lux%lu st%lu use%lx ld%lu sr%lu%s",i,(unsigned long)t.pixelFormat,
+      (unsigned long)t.width,(unsigned long)t.height,(unsigned long)t.storageMode,(unsigned long)t.usage,
+      (unsigned long)c.loadAction,(unsigned long)c.storeAction,surface?" iosurface":"");
+    }
+    if(d.depthAttachment.texture)at+=snprintf(line+at,sizeof line-at," depth fmt%lu",(unsigned long)d.depthAttachment.texture.pixelFormat);
+    if(d.stencilAttachment.texture)snprintf(line+at,sizeof line-at," stencil fmt%lu",(unsigned long)d.stencilAttachment.texture.pixelFormat);
+    sm2_logs(line);
+   }
   }
  }
  auto attachment=[&](MTLRenderPassAttachmentDescriptor *a,NmbPassAttachment &out)->bool {
