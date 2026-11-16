@@ -139,7 +139,7 @@ echo "== phone tests"
 cd "$ROOT/phone/turnip"
 rm -rf out && mkdir -p out
 : > out/shaders.h
-for s in fill.comp:fill_comp tri.vert:tri_vert tri.frag:tri_frag; do
+for s in fill.comp:fill_comp tri.vert:tri_vert tri.frag:tri_frag full.vert:full_vert half.frag:half_frag; do
 	glslangValidator -V --target-env vulkan1.2 --vn "${s#*:}" -o out/"${s#*:}".h shaders/"${s%%:*}" >/dev/null
 	cat out/"${s#*:}".h >> out/shaders.h
 done

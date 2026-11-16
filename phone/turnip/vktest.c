@@ -1,6 +1,6 @@
 /*
  * vktest: Turnip (libvulkan_freedreno.dylib, darwin backend) on the A640 through SweetAccelerator v2.
- *   vktest [LIB]      (default /var/local/lib/libvulkan_freedreno.dylib)
+ *   vktest [LIB [bench]]      (default /var/local/lib/libvulkan_freedreno.dylib; bench: the blend benchmark only)
  * Steps, each checked: device info, a buffer fill + copy, a compute shader compiled on the phone,
  * a triangle rendered into a 256x256 RGBA8 image and read back. Prints PASS/FAIL per step.
  */
@@ -11,7 +11,7 @@
 #include <time.h>
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
-#include "shaders.h"	/* fill_comp, tri_vert, tri_frag: SPIR-V words (build.sh) */
+#include "shaders.h"	/* fill_comp, tri_vert, tri_frag, full_vert, half_frag: SPIR-V words (build.sh) */
 
 static PFN_vkGetInstanceProcAddr gipa;
 static PFN_vkGetDeviceProcAddr gdpa;
@@ -301,6 +301,161 @@ static int test_draw(void)
 	return !ok;
 }
 
+/*
+ * vktest LIB bench: the blend benchmark. Core Animation blends many full-screen layers into the framebuffer,
+ * a linear IOSurface, in sysmem. How much does the target's layout cost? An 860x1864 B8G8R8A8 image, LINEAR or
+ * OPTIMAL (UBWC where Turnip gives it), loaded, N full-screen alpha-blended layers drawn, stored; and the copy of
+ * an OPTIMAL image into a LINEAR one (the price of rendering into a tiled shadow). Each case 10 times, after a warm
+ * run; the time per submission (submit to fence). TU_DEBUG=sysmem / gmem / noubwc pick the rest.
+ */
+static VkPipeline bench_pipeline(VkPipelineLayout pl, VkFormat fmt)
+{
+	DFN(vkCreateGraphicsPipelines);
+	VkPipelineShaderStageCreateInfo st[2] = {
+		{ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,
+		  .module = module(full_vert, sizeof(full_vert)), .pName = "main" },
+		{ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+		  .module = module(half_frag, sizeof(half_frag)), .pName = "main" },
+	};
+	VkPipelineVertexInputStateCreateInfo vin = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+	VkPipelineInputAssemblyStateCreateInfo ia = { .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+		.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST };
+	VkPipelineViewportStateCreateInfo vp = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1,
+		.scissorCount = 1 };
+	VkPipelineRasterizationStateCreateInfo rs = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+		.polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE, .lineWidth = 1 };
+	VkPipelineMultisampleStateCreateInfo ms = { .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+		.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
+	VkPipelineColorBlendAttachmentState cba = { .blendEnable = VK_TRUE, .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA,
+		.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, .colorBlendOp = VK_BLEND_OP_ADD,
+		.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE, .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+		.alphaBlendOp = VK_BLEND_OP_ADD, .colorWriteMask = 0xf };
+	VkPipelineColorBlendStateCreateInfo cb = { .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+		.attachmentCount = 1, .pAttachments = &cba };
+	VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+	VkPipelineDynamicStateCreateInfo ds = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 2,
+		.pDynamicStates = dyn };
+	VkPipelineRenderingCreateInfo ri = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = 1,
+		.pColorAttachmentFormats = &fmt };
+	VkGraphicsPipelineCreateInfo gpi = { .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri,
+		.stageCount = 2, .pStages = st, .pVertexInputState = &vin, .pInputAssemblyState = &ia, .pViewportState = &vp,
+		.pRasterizationState = &rs, .pMultisampleState = &ms, .pColorBlendState = &cb, .pDynamicState = &ds, .layout = pl };
+	VkPipeline p;
+	CHECK(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpi, NULL, &p));
+	return p;
+}
+
+struct bimg { VkImage img; VkImageView view; };
+
+static struct bimg bench_image(uint32_t W, uint32_t H, VkFormat fmt, VkImageTiling tiling)
+{
+	DFN(vkCreateImage); DFN(vkGetImageMemoryRequirements); DFN(vkAllocateMemory); DFN(vkBindImageMemory);
+	DFN(vkCreateImageView);
+	struct bimg b;
+	VkImageCreateInfo ii = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = fmt,
+		.extent = { W, H, 1 }, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = tiling,
+		.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT };
+	CHECK(vkCreateImage(dev, &ii, NULL, &b.img));
+	VkMemoryRequirements mr;
+	vkGetImageMemoryRequirements(dev, b.img, &mr);
+	VkMemoryAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size,
+		.memoryTypeIndex = memtype(mr.memoryTypeBits, tiling == VK_IMAGE_TILING_LINEAR ? VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT :
+					   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) };
+	VkDeviceMemory m;
+	CHECK(vkAllocateMemory(dev, &ai, NULL, &m));
+	CHECK(vkBindImageMemory(dev, b.img, m, 0));
+	VkImageViewCreateInfo vi = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = b.img, .viewType = VK_IMAGE_VIEW_TYPE_2D,
+		.format = fmt, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+	CHECK(vkCreateImageView(dev, &vi, NULL, &b.view));
+	/* to GENERAL once, cleared */
+	DFN(vkCmdPipelineBarrier); DFN(vkCmdClearColorImage);
+	VkCommandBuffer c = begin();
+	VkImageMemoryBarrier bar = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+		.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL, .image = b.img,
+		.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+	vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &bar);
+	VkClearColorValue cv = { .float32 = { 0, 0, 0, 1 } };
+	VkImageSubresourceRange rr = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+	vkCmdClearColorImage(c, b.img, VK_IMAGE_LAYOUT_GENERAL, &cv, 1, &rr);
+	submit_wait(c);
+	return b;
+}
+
+static double bench_layers(VkPipeline p, struct bimg b, uint32_t W, uint32_t H, unsigned layers)
+{
+	DFN(vkCmdBeginRendering); DFN(vkCmdEndRendering); DFN(vkCmdBindPipeline); DFN(vkCmdDraw);
+	DFN(vkCmdSetViewport); DFN(vkCmdSetScissor); DFN(vkCmdPipelineBarrier);
+	double total = 0;
+	for (int run = 0; run < 11; run++) {
+		VkCommandBuffer c = begin();
+		VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+			.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+			.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT };
+		vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 1, &mb, 0, NULL,
+				     0, NULL);
+		VkRenderingAttachmentInfo att = { .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = b.view,
+			.imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+			.storeOp = VK_ATTACHMENT_STORE_OP_STORE };
+		VkRenderingInfo rinfo = { .sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = { { 0, 0 }, { W, H } },
+			.layerCount = 1, .colorAttachmentCount = 1, .pColorAttachments = &att };
+		vkCmdBeginRendering(c, &rinfo);
+		vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+		VkViewport v = { 0, 0, W, H, 0, 1 };
+		VkRect2D sc = { { 0, 0 }, { W, H } };
+		vkCmdSetViewport(c, 0, 1, &v);
+		vkCmdSetScissor(c, 0, 1, &sc);
+		for (unsigned l = 0; l < layers; l++)
+			vkCmdDraw(c, 3, 1, 0, 0);
+		vkCmdEndRendering(c);
+		double t = submit_wait(c);
+		if (run)
+			total += t;	/* the first run warms up */
+	}
+	return total / 10;
+}
+
+static double bench_copy(struct bimg from, struct bimg to, uint32_t W, uint32_t H)
+{
+	DFN(vkCmdCopyImage); DFN(vkCmdPipelineBarrier);
+	double total = 0;
+	for (int run = 0; run < 11; run++) {
+		VkCommandBuffer c = begin();
+		VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+			.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT };
+		vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+		VkImageCopy r = { .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+			.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .extent = { W, H, 1 } };
+		vkCmdCopyImage(c, from.img, VK_IMAGE_LAYOUT_GENERAL, to.img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+		double t = submit_wait(c);
+		if (run)
+			total += t;
+	}
+	return total / 10;
+}
+
+static int test_bench(void)
+{
+	DFN(vkCreatePipelineLayout);
+	const uint32_t W = 860, H = 1864;
+	const VkFormat fmt = VK_FORMAT_B8G8R8A8_UNORM;
+	VkPipelineLayoutCreateInfo pli = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+	VkPipelineLayout pl;
+	CHECK(vkCreatePipelineLayout(dev, &pli, NULL, &pl));
+	VkPipeline p = bench_pipeline(pl, fmt);
+	struct bimg lin = bench_image(W, H, fmt, VK_IMAGE_TILING_LINEAR);
+	struct bimg opt = bench_image(W, H, fmt, VK_IMAGE_TILING_OPTIMAL);
+	const char *dbg = getenv("TU_DEBUG");
+	printf("BENCH %ux%u B8G8R8A8, TU_DEBUG=%s (ms per submission, mean of 10)\n", W, H, dbg ? dbg : "(none)");
+	const unsigned counts[] = { 1, 20, 140 };
+	for (unsigned i = 0; i < 3; i++) {
+		double tl = bench_layers(p, lin, W, H, counts[i]);
+		double to = bench_layers(p, opt, W, H, counts[i]);
+		printf("BENCH %3u layers: linear %7.2f   optimal %7.2f   (linear/optimal %.2fx)\n", counts[i], tl, to, to > 0 ? tl / to : 0);
+	}
+	printf("BENCH copy optimal -> linear (one full frame): %.2f ms\n", bench_copy(opt, lin, W, H));
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	const char *lib = argc > 1 ? argv[1] : "/var/local/lib/libvulkan_freedreno.dylib";
@@ -352,6 +507,8 @@ int main(int argc, char **argv)
 	vkGetDeviceQueue(dev, 0, 0, &queue);
 	VkCommandPoolCreateInfo cpi = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = 0 };
 	CHECK(vkCreateCommandPool(dev, &cpi, NULL, &pool));
+	if (argc > 2 && !strcmp(argv[2], "bench"))
+		return test_bench();
 	int fails = test_empty();
 	fails += test_fill();
 	fails += test_compute();
