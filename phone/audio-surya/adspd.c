@@ -906,6 +906,66 @@ static void pdm_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 	qrtr_send(QRTR_TYPE_DATA, PDM_PORT, h->src_node, h->src_port, q.b, (uint32_t)qmi_finish(&q));
 }
 
+/*
+ * The service registry's notifier (service 0x42, Linux drivers/soc/qcom/pdr_interface.c): which state a protection
+ * domain is in. REGISTER_LISTENER (0x20: enable, service path) answers with the current state; a change comes as
+ * STATE_UPDATED (0x22) indications, each acked with SET_ACK (0x23), as Android's audio notifier does.
+ */
+#define SRVREG_CLIENT_PORT	0x4002
+static uint32_t srvreg_node, srvreg_port;
+
+static const char *pd_state(uint32_t s)
+{
+	return s == 0x1fffffff ? "UP" : s == 0x0fffffff ? "DOWN" : s == 0x2fffffff ? "EARLY DOWN" :
+	       s == 0x7fffffff ? "UNINITIALISED" : "?";
+}
+
+static void srvreg_query(const char *path)
+{
+	static uint16_t txn = 1;
+	struct qmi_buf q;
+	if (!srvreg_port) {
+		LOG("pdr: the service registry has not shown up");
+		return;
+	}
+	qmi_start(&q, QMI_REQUEST, txn++, 0x20);
+	qmi_tlv_u8(&q, 0x01, 1);
+	qmi_tlv(&q, 0x02, path, (uint16_t)strlen(path));
+	qrtr_send(QRTR_TYPE_DATA, SRVREG_CLIENT_PORT, srvreg_node, srvreg_port, q.b, (uint32_t)qmi_finish(&q));
+}
+
+static void srvreg_handle(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
+{
+	struct qmi_msg m;
+	uint32_t st = 0;
+	uint16_t l = 0;
+	if (qmi_parse(d, n, &m))
+		return;
+	if (m.type == QMI_RESPONSE && m.id == 0x20) {
+		const uint8_t *r = qmi_get(&m, 0x02, &l);
+		uint16_t res = r && l >= 4 ? (uint16_t)(r[0] | r[1] << 8) : 0xffff, err = r && l >= 4 ? (uint16_t)(r[2] | r[3] << 8) : 0;
+		int has = qmi_get_u32(&m, 0x10, &st) == 0;
+		LOG("pdr: registered: result %u error %#x, state %#x %s", res, err, st, has ? pd_state(st) : "(none given)");
+	} else if (m.type == QMI_INDICATION && m.id == 0x22) {
+		char path[80] = "";
+		uint16_t txn = 0;
+		const uint8_t *pp = qmi_get(&m, 0x02, &l), *tp;
+		qmi_get_u32(&m, 0x01, &st);
+		if (pp)
+			memcpy(path, pp, l < sizeof(path) - 1 ? l : sizeof(path) - 1);
+		if ((tp = qmi_get(&m, 0x03, &l)) && l >= 2)
+			txn = (uint16_t)(tp[0] | tp[1] << 8);
+		LOG("pdr: \"%s\" is now %s (%#x): acked", path, pd_state(st), st);
+		struct qmi_buf q;
+		qmi_start(&q, QMI_REQUEST, 0x100 + txn, 0x23);
+		qmi_tlv(&q, 0x01, path, (uint16_t)strlen(path));
+		qmi_tlv(&q, 0x02, &txn, 2);
+		qrtr_send(QRTR_TYPE_DATA, SRVREG_CLIENT_PORT, h->src_node, h->src_port, q.b, (uint32_t)qmi_finish(&q));
+	} else if (m.type != QMI_RESPONSE || m.id != 0x23) {
+		LOG("pdr: message type %u id %#x", m.type, m.id);
+	}
+}
+
 static void qrtr_rx(const uint8_t *d, uint32_t n)
 {
 	struct qrtr_hdr h;
@@ -932,6 +992,10 @@ static void qrtr_rx(const uint8_t *d, uint32_t n)
 	case QRTR_TYPE_NEW_SERVER:
 		LOG("qrtr: < NEW_SERVER service %#x version %u instance %u at %u:%#x", w[1], w[2] & 0xff, w[2] >> 8, w[3],
 		    w[4]);
+		if (w[1] == 0x42) {	/* the service registry's notifier (PDR) */
+			srvreg_node = w[3];
+			srvreg_port = w[4];
+		}
 		break;
 	case QRTR_TYPE_DEL_SERVER:
 		LOG("qrtr: < DEL_SERVER service %#x at %u:%#x", w[1], w[3], w[4]);
@@ -942,6 +1006,8 @@ static void qrtr_rx(const uint8_t *d, uint32_t n)
 	case QRTR_TYPE_DATA:
 		if (h.dst_port == PDM_PORT)
 			pdm_handle(&h, p, len);
+		else if (h.dst_port == SRVREG_CLIENT_PORT)
+			srvreg_handle(&h, p, len);
 		else
 			LOG("qrtr: < DATA %u bytes from %u:%#x to port %#x", len, h.src_node, h.src_port, h.dst_port);
 		if (h.confirm_rx) {
@@ -1941,9 +2007,16 @@ static int tone(unsigned secs)
 	LOG("tone: up to step %u", steps);
 	{
 		const char *pe = getenv("ADSPD_AUDIOPD");
+		srvreg_query("msm/adsp/root_pd");
+		poll_for(200);
+		srvreg_query("msm/adsp/audio_pd");
+		poll_for(300);
 		if (!pe || atoi(pe)) {
 			if (audiopd_start())
 				goto out;
+			poll_for(500);
+			srvreg_query("msm/adsp/audio_pd");
+			poll_for(300);
 			if (listener_start())
 				LOG("tone: the listener did not start (going on)");
 			poll_for(3000);	/* let the PD come up, asking for what it needs */
