@@ -560,9 +560,11 @@ struct chan {
 
 static void qrtr_rx(const uint8_t *d, uint32_t n);
 static void apr_rx(const uint8_t *d, uint32_t n);
+static void frpc_rx(const uint8_t *d, uint32_t n);
 static struct chan chans[] = {
 	{ .name = "IPCRTR", .lcid = 1, .rx = qrtr_rx },
 	{ .name = "apr_audio_svc", .lcid = 2, .rx = apr_rx },
+	{ .name = "fastrpcglink-apps-dsp", .lcid = 3, .rx = frpc_rx },
 };
 #define NCHAN	(sizeof(chans) / sizeof(chans[0]))
 static int g_version_done;
@@ -1243,47 +1245,47 @@ static void pin_activity(unsigned pin, const char *name)
 	LOG("tone: gpio%u (%s): %u changes, %u ones in %u reads", pin, name, changes, ones, reads);
 }
 
-/* the stream's SMMU bank (translation off), as wland's smmu_wlan_identity */
-static int smmu_slot = -1, smmu_cb = -1;
+/* a stream's SMMU bank (translation off), as wland's smmu_wlan_identity: [0] the audio buffers, [1] FastRPC */
+static int smmu_slots[2] = { -1, -1 }, smmu_cbs[2] = { -1, -1 };
+static uint32_t smmu_sids[2];
 static uint32_t smmu_psize, smmu_npage;
 
-static int smmu_audio_identity(void)
+static int smmu_identity(int which, uint32_t sid)
 {
 	uint64_t s = SMMU_PA;
 	uint32_t id0 = rd32(s + 0x20), id1 = rd32(s + 0x24), nsmr = id0 & 0xff, ncb = id1 & 0xff;
 	uint64_t used[4] = { 0 };
+	int slot = -1, cb = -1;
 	smmu_psize = (id1 >> 31) ? 0x10000 : 0x1000;
 	smmu_npage = 1u << (((id1 >> 28) & 7) + 1);
 	/* never read sCR0/sCR1 on SM7150 (wland radio.c): the access hangs the CPU */
 	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
 		uint32_t smr = rd32(s + 0x800 + 4 * i), s2cr = rd32(s + 0xc00 + 4 * i);
 		if (!(smr >> 31)) {
-			if (smmu_slot < 0)
-				smmu_slot = (int)i;
+			if (slot < 0)
+				slot = (int)i;
 			continue;
 		}
 		if (((s2cr >> 16) & 3) == 0)
 			used[(s2cr & 0xff) / 64] |= 1ull << ((s2cr & 0xff) % 64);
 		uint32_t id = smr & 0x7fff, m = (smr >> 16) & 0x7fff;
-		if (((id ^ AUDIO_SID) & ~m & 0x7fff) == 0) {
-			LOG("tone: smmu: SMR%u %08x already matches %#x (S2CR %08x): left as it is", i, smr, AUDIO_SID, s2cr);
-			smmu_slot = -1;
+		if (((id ^ sid) & ~m & 0x7fff) == 0) {
+			LOG("smmu: SMR%u %08x already matches %#x (S2CR %08x): left as it is", i, smr, sid, s2cr);
 			return ((s2cr >> 16) & 3) == 1 ? 0 : -1;
 		}
 	}
 	for (uint32_t c = 0; c < ncb && c < 256; c++) {
 		uint64_t cbp = s + (uint64_t)smmu_npage * smmu_psize + (uint64_t)c * smmu_psize;
 		if (!(used[c / 64] & (1ull << (c % 64))) && !(rd32(cbp) & 1) && rd32(s + smmu_psize + 4 * c) == 0) {
-			smmu_cb = (int)c;
+			cb = (int)c;
 			break;
 		}
 	}
-	if (smmu_slot < 0 || smmu_cb < 0 || (uint64_t)(smmu_npage + smmu_cb + 1) * smmu_psize > SMMU_SIZE) {
-		LOG("tone: smmu: no free SMR/bank (SMR %d, bank %d)", smmu_slot, smmu_cb);
-		smmu_slot = -1;
+	if (slot < 0 || cb < 0 || (uint64_t)(smmu_npage + cb + 1) * smmu_psize > SMMU_SIZE) {
+		LOG("smmu: no free SMR/bank for %#x (SMR %d, bank %d)", sid, slot, cb);
 		return -1;
 	}
-	uint64_t gr1 = s + smmu_psize, cbp = s + (uint64_t)smmu_npage * smmu_psize + (uint64_t)smmu_cb * smmu_psize;
+	uint64_t gr1 = s + smmu_psize, cbp = s + (uint64_t)smmu_npage * smmu_psize + (uint64_t)cb * smmu_psize;
 	wr32(cbp + 0x58, 0xffffffff);
 	wr32(cbp + 0x20, 0);
 	wr32(cbp + 0x24, 0);
@@ -1291,32 +1293,163 @@ static int smmu_audio_identity(void)
 	wr32(cbp + 0x10, 0);
 	wr32(cbp + 0x38, 0);
 	wr32(cbp + 0x3c, 0);
-	wr32(gr1 + 0x800 + 4 * smmu_cb, CB_CBA2R);
-	wr32(gr1 + 4 * smmu_cb, CB_CBAR);
+	wr32(gr1 + 0x800 + 4 * cb, CB_CBA2R);
+	wr32(gr1 + 4 * cb, CB_CBAR);
 	wr32(cbp, CB_SCTLR);
-	wr32(s + 0xc00 + 4 * smmu_slot, (uint32_t)smmu_cb);
-	wr32(s + 0x800 + 4 * smmu_slot, (1u << 31) | AUDIO_SID);
+	wr32(s + 0xc00 + 4 * slot, (uint32_t)cb);
+	wr32(s + 0x800 + 4 * slot, (1u << 31) | sid);
 	wr32(s + 0x70, 0);
 	for (int i = 0; i < 1000 && (rd32(s + 0x74) & 1); i++)
 		delay_ms(1);
-	uint32_t smr = rd32(s + 0x800 + 4 * smmu_slot), s2cr = rd32(s + 0xc00 + 4 * smmu_slot);
-	int ok = smr == ((1u << 31) | AUDIO_SID) && (s2cr & 0x300ff) == (uint32_t)smmu_cb;
-	LOG("tone: smmu: stream %#x -> CB%d via SMR%d (translation off): SMR %08x S2CR %08x -> %s", AUDIO_SID, smmu_cb,
-	    smmu_slot, smr, s2cr, ok ? "ok" : "NOT as written");
+	uint32_t smr = rd32(s + 0x800 + 4 * slot), s2cr = rd32(s + 0xc00 + 4 * slot);
+	int ok = smr == ((1u << 31) | sid) && (s2cr & 0x300ff) == (uint32_t)cb;
+	LOG("smmu: stream %#x -> CB%d via SMR%d (translation off): SMR %08x S2CR %08x -> %s", sid, cb, slot, smr, s2cr,
+	    ok ? "ok" : "NOT as written");
+	smmu_slots[which] = slot;
+	smmu_cbs[which] = cb;
+	smmu_sids[which] = sid;
 	return ok ? 0 : -1;
 }
 
-static void smmu_audio_report_and_off(void)
+static void smmu_report_and_off(int which)
 {
-	if (smmu_slot < 0)
+	int slot = smmu_slots[which], cb = smmu_cbs[which];
+	if (slot < 0)
 		return;
-	uint64_t s = SMMU_PA, cbp = s + (uint64_t)smmu_npage * smmu_psize + (uint64_t)smmu_cb * smmu_psize;
+	uint64_t s = SMMU_PA, cbp = s + (uint64_t)smmu_npage * smmu_psize + (uint64_t)cb * smmu_psize;
 	uint32_t fsr = rd32(cbp + 0x58);	/* fault bits 0xc00001fe; bits 9-10 are only the format */
-	LOG("tone: smmu: CB%d FSR %#x%s", smmu_cb, fsr, (fsr & 0xc00001feu) ? " (FAULTS: the DSP was refused)" : " (no faults)");
-	wr32(s + 0x800 + 4 * smmu_slot, 0);
-	wr32(s + 0xc00 + 4 * smmu_slot, 0x20000);	/* fault, as an unused entry */
-	wr32(s + smmu_psize + 4 * smmu_cb, 0);
-	smmu_slot = -1;
+	LOG("smmu: stream %#x CB%d FSR %#x%s", smmu_sids[which], cb, fsr,
+	    (fsr & 0xc00001feu) ? " (FAULTS: the DSP was refused)" : " (no faults)");
+	wr32(s + 0x800 + 4 * slot, 0);
+	wr32(s + 0xc00 + 4 * slot, 0x20000);	/* fault, as an unused entry */
+	wr32(s + smmu_psize + 4 * cb, 0);
+	smmu_slots[which] = -1;
+}
+
+/* ---- the audio PD: started over FastRPC, as Android's audioadsprpcd audiopd ----
+ *
+ * The audio services (pd-mapper: "avs/audio" -> msm/adsp/audio_pd) live in a user PD of the ADSP that the
+ * HLOS starts: Linux drivers/misc/fastrpc.c fastrpc_init_create_static_process, on the GLINK channel
+ * "fastrpcglink-apps-dsp". Without it the root PD answers the core service and AFE's queries, but every
+ * command that sets something is never answered. surya (live.dts): qcom,msm_fastrpc qcom,adsp-remoteheap-vmid
+ * <22 37> (LPASS, ADSP heap); adsprpc compute CBs iommus 0x1b23 / 0x1b24 (the low four bits of the stream in
+ * bits 32-35 of the addresses the DSP is given, as the audio buffers); the remote heap comes from adsp_region
+ * (12 MB below 4 GB, 4 MB aligned): here 4 MB at 0xa1800000, RAM below 4 GB that nothing uses (the fixed
+ * carve-outs end at 0xa1600000, the GPU pool starts at 0xa2000000). It is given to VMIDs 22 and 37 with
+ * TrustZone's MP_ASSIGN (qcom_scm_assign_mem) and stays theirs until the phone restarts.
+ */
+#define FRPC_SID		0x1b23
+#define FRPC_ADDR(pa)		((pa) | (3ull << 32))
+#define FRPC_BUF_PA		0xe1080000ull		/* the invoke's buffer, 64 KB in our 1 MB */
+#define SCM_ARGS_PA		0xe10c0000ull		/* MP_ASSIGN's tables */
+#define HEAP_PA			0xa1800000ull
+#define HEAP_SIZE		0x00400000ull
+#define VMID_HLOS		3
+#define VMID_LPASS		22
+#define VMID_ADSP_HEAP		37
+#define PERM_RWX		7
+
+static int frpc_got, frpc_retval;
+static uint64_t frpc_ctx_back;
+
+static void frpc_rx(const uint8_t *d, uint32_t n)
+{
+	if (n < 12) {
+		LOG("fastrpc: < %u bytes (short)", n);
+		return;
+	}
+	memcpy(&frpc_ctx_back, d, 8);
+	memcpy(&frpc_retval, d + 8, 4);
+	frpc_got = 1;
+	LOG("fastrpc: < response: ctx %#llx retval %d (%u bytes)", (unsigned long long)frpc_ctx_back, frpc_retval, n);
+}
+
+/* TrustZone MP_ASSIGN (Linux qcom_scm_assign_mem): HLOS -> LPASS + ADSP heap, read/write/exec. */
+static int hyp_assign_heap(void)
+{
+	uint8_t t[192] = { 0 };
+	uint64_t mem[2] = { HEAP_PA, HEAP_SIZE };
+	uint32_t src[1] = { VMID_HLOS };
+	struct { uint32_t vmid, perm; uint64_t ctx; uint32_t ctx_size, unused; } __attribute__((packed)) dst[2] = {
+		{ VMID_LPASS, PERM_RWX, 0, 0, 0 }, { VMID_ADSP_HEAP, PERM_RWX, 0, 0, 0 } };
+	/* the tables, each 64-byte aligned: the memory at 0, the source VM list at 64, the destinations at 128 */
+	memcpy(t, mem, sizeof(mem));
+	memcpy(t + 64, src, sizeof(src));
+	memcpy(t + 128, dst, sizeof(dst));
+	pm_wr(SCM_ARGS_PA, t, sizeof(t));
+	/* args: 0 memory table, 1 its size, 2 source list, 3 its size, 4 destination table, 5 its size, 6 flags.
+	 * Past the first three, they go in a buffer whose address is x5 (qcom_scm-smc.c, more than 4 args). */
+	uint64_t ext[4] = { sizeof(src), SCM_ARGS_PA + 128, sizeof(dst), 0 };
+	pm_wr(SCM_ARGS_PA + 0x400, ext, sizeof(ext));
+	uint64_t x[8] = { 0x42000c16ull /* SIP, svc MP 0xc, cmd ASSIGN 0x16 */,
+			  7u | (1u << 4) | (1u << 8) | (1u << 12) /* RO VAL RO VAL RO VAL VAL */,
+			  SCM_ARGS_PA, sizeof(mem), SCM_ARGS_PA + 64, SCM_ARGS_PA + 0x400, 0, 0 };
+	pm_smc(x);
+	LOG("fastrpc: heap %#llx+%#llx -> VMIDs %u, %u: MP_ASSIGN -> %lld/%llx", (unsigned long long)HEAP_PA,
+	    (unsigned long long)HEAP_SIZE, VMID_LPASS, VMID_ADSP_HEAP, (long long)x[0], (unsigned long long)x[1]);
+	return x[0] == 0 ? 0 : -1;
+}
+
+/* FASTRPC_RMID_INIT_CREATE_STATIC "audiopd" on handle 1 (the init handle), as a kernel invoke. */
+static int audiopd_start(void)
+{
+	struct chan *c = &chans[2];
+	if (!(c->open_acked && c->remote_open)) {
+		uint64_t end = now_ms() + 2000;
+		while (now_ms() < end && !(c->open_acked && c->remote_open))
+			poll_for(10);
+	}
+	if (!(c->open_acked && c->remote_open)) {
+		LOG("fastrpc: channel \"%s\" is not open", c->name);
+		return -1;
+	}
+	if (smmu_identity(1, FRPC_SID))
+		return -1;
+	if (hyp_assign_heap())
+		return -1;
+	/* the invoke's buffer (fastrpc_get_args): metadata for 3 scalars, then each argument 128-byte aligned */
+	enum { NSC = 3, META = (16 + 8 + 16) * NSC + 8 * 16 + 4 * 64 };
+	const uint64_t dsp = FRPC_ADDR(FRPC_BUF_PA);
+	const char name[] = "audiopd";
+	struct { int32_t client_id; uint32_t namelen, pageslen; } inbuf = { (int32_t)getpid(), sizeof(name), 1 };
+	struct { uint64_t addr, size; } heap = { HEAP_PA, HEAP_SIZE };
+	const struct { const void *p; uint32_t len; } a[NSC] = { { &inbuf, sizeof(inbuf) }, { name, sizeof(name) },
+								 { &heap, sizeof(heap) } };
+	uint8_t b[1024] = { 0 };
+	uint64_t *rpra = (uint64_t *)b;				/* { pv, len } x 3 */
+	uint32_t *list = (uint32_t *)(b + 16 * NSC);		/* { num, pgidx } x 3 */
+	uint64_t *pages = (uint64_t *)(b + 24 * NSC);		/* { addr, size } x 3 */
+	uint32_t off = (META + 127) & ~127u;
+	for (int i = 0; i < NSC; i++) {
+		off = (off + 127) & ~127u;
+		rpra[2 * i] = dsp + off;			/* pv: only its offset in the page matters to the DSP */
+		rpra[2 * i + 1] = a[i].len;
+		list[2 * i] = 1;
+		list[2 * i + 1] = (uint32_t)i;
+		pages[2 * i] = (dsp + off) & ~0xfffull;
+		pages[2 * i + 1] = 4096;
+		memcpy(b + off, a[i].p, a[i].len);
+		off += a[i].len;
+	}
+	uint32_t pkt = off;
+	pm_wr(FRPC_BUF_PA, b, sizeof(b));
+	struct { int32_t client_id, tid; uint64_t ctx; uint32_t handle, sc; uint64_t addr, size; } __attribute__((packed)) msg = {
+		0, (int32_t)getpid(), (1u << 4) | 1 /* ctx id 1, USER_PD */, 1 /* FASTRPC_INIT_HANDLE */,
+		(8u << 24) | (3u << 16) /* FASTRPC_SCALARS(INIT_CREATE_STATIC, 3, 0) */, dsp, (pkt + 4095) & ~4095u };
+	frpc_got = 0;
+	LOG("fastrpc: > create static \"audiopd\": buffer %#llx (%u bytes), heap %#llx+%#llx", (unsigned long long)dsp, pkt,
+	    (unsigned long long)HEAP_PA, (unsigned long long)HEAP_SIZE);
+	if (ch_send(c, &msg, sizeof(msg)))
+		return -1;
+	uint64_t end = now_ms() + 5000;
+	while (now_ms() < end && !frpc_got)
+		poll_for(5);
+	if (!frpc_got) {
+		LOG("fastrpc: no response in 5 s");
+		return -1;
+	}
+	LOG("fastrpc: audiopd %s (retval %d)", frpc_retval == 0 ? "STARTED" : "REFUSED", frpc_retval);
+	return frpc_retval == 0 ? 0 : -1;
 }
 
 /* 1 kHz at 48 kHz, -20 dBFS: one cycle */
@@ -1356,6 +1489,14 @@ static int tone(unsigned secs)
 	if (secs > 10)
 		secs = 10;
 	LOG("tone: up to step %u", steps);
+	{
+		const char *pe = getenv("ADSPD_AUDIOPD");
+		if (!pe || atoi(pe)) {
+			if (audiopd_start())
+				goto out;
+			poll_for(500);	/* let the PD come up and register */
+		}
+	}
 	if (steps == 0) {
 		/* probes that touch nothing: which services answer, and more than once? */
 		uint32_t bogus = 0x1234;
@@ -1375,7 +1516,7 @@ static int tone(unsigned secs)
 		}
 		goto out;
 	}
-	if (smmu_audio_identity())
+	if (smmu_identity(0, AUDIO_SID))
 		goto out;
 	/*
 	 * In the order that tells most when something stays silent: ASM first (memory only, no hardware), then
@@ -1527,7 +1668,8 @@ out:
 		cmd("port 0x1004, stop", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_STOP, start, sizeof(start), 0);
 	if (clock_on)
 		afe_clock(0);
-	smmu_audio_report_and_off();
+	smmu_report_and_off(0);
+	smmu_report_and_off(1);
 	pins_off();
 	LOG("tone: %s", ok ? "THE DSP PLAYED THE TONE TO THE SPEAKER PORT (amplifiers off: silent)" : "FAILED");
 	return ok ? 0 : 3;
