@@ -1567,6 +1567,15 @@ static uint32_t frpc_build(uint64_t pa, uint32_t cap, int nin, const void *const
 	uint64_t *rpra = (uint64_t *)hdr;
 	uint32_t *list = (uint32_t *)(hdr + 16 * nsc);
 	uint64_t *pages = (uint64_t *)(hdr + 24 * nsc);
+	/* ADSPD_FRPC_LAYOUT (debugging the first invokes with output buffers, refused with EBADPARM): bit 0 puts the
+	 * outputs on pages of their own (an input's page then never also listed writable), bit 1 gives pv without the
+	 * stream's bits 32-35 (the page list keeps them) */
+	static int layout = -1;
+	if (layout < 0) {
+		const char *e = getenv("ADSPD_FRPC_LAYOUT");
+		layout = e ? atoi(e) : 0;
+		LOG("fastrpc: invoke layout %d", layout);
+	}
 	for (int i = 0; i < nsc; i++) {
 		uint32_t len = i < nin ? inl[i] : outl[i - nin];
 		list[2 * i + 1] = (uint32_t)i;
@@ -1574,10 +1583,12 @@ static uint32_t frpc_build(uint64_t pa, uint32_t cap, int nin, const void *const
 		if (!len)
 			continue;
 		off = (off + 127) & ~127u;
+		if ((layout & 1) && i == nin)
+			off = (off + 4095) & ~4095u;
 		if (off + len > cap)
 			return 0;
 		uint64_t pv = dsp + off;
-		rpra[2 * i] = pv;
+		rpra[2 * i] = (layout & 2) ? (pa + off) : pv;
 		list[2 * i] = 1;
 		pages[2 * i] = pv & ~0xfffull;
 		pages[2 * i + 1] = (((pv + len - 1) >> 12) - (pv >> 12) + 1) * 4096;
@@ -1960,10 +1971,12 @@ static int listener_start(void)
 		return -1;
 	/* (with next2 sent first, this open was never answered: the open goes first, next2 before the register) */
 	const char name[] = "adsp_default_listener";
-	uint32_t prim_in[2] = { sizeof(name), 128 }, prim_out[2] = { 0, 0 };
-	char dlerr[128] = "";
+	const char *le = getenv("ADSPD_FRPC_LAYOUT");
+	uint32_t dl = le && (atoi(le) & 4) ? 255 : 128;	/* layout bit 2: quic/fastrpc's 255-byte dlerror */
+	uint32_t prim_in[2] = { sizeof(name), dl }, prim_out[2] = { 0, 0 };
+	char dlerr[256] = "";
 	const void *ind[2] = { prim_in, name };
-	uint32_t inl[2] = { 8, sizeof(name) }, outl[2] = { 8, sizeof(dlerr) };
+	uint32_t inl[2] = { 8, sizeof(name) }, outl[2] = { 8, dl };
 	void *outp[2] = { prim_out, dlerr };
 	r = frpc_call("remotectl open \"adsp_default_listener\"", 0, SCALARS(0, 2, 2), 2, ind, inl, 2, outl, outp);
 	dlerr[sizeof(dlerr) - 1] = 0;
@@ -2020,10 +2033,12 @@ static int root_log_start(void)
 	if (lsn_next(0, -1, NULL, 0))
 		return -1;
 	const char name[] = "adspmsgd_adsp";
-	uint32_t prim_in[2] = { sizeof(name), 128 }, prim_out[2] = { 0, 0 };
-	char dlerr[128] = "";
+	const char *le = getenv("ADSPD_FRPC_LAYOUT");
+	uint32_t dl = le && (atoi(le) & 4) ? 255 : 128;	/* layout bit 2: quic/fastrpc's 255-byte dlerror */
+	uint32_t prim_in[2] = { sizeof(name), dl }, prim_out[2] = { 0, 0 };
+	char dlerr[256] = "";
 	const void *ind2[2] = { prim_in, name };
-	uint32_t inl2[2] = { 8, sizeof(name) }, outl[2] = { 8, sizeof(dlerr) };
+	uint32_t inl2[2] = { 8, sizeof(name) }, outl[2] = { 8, dl };
 	void *outp[2] = { prim_out, dlerr };
 	int32_t r = frpc_call("remotectl open \"adspmsgd_adsp\" (root)", 0, SCALARS(0, 2, 2), 2, ind2, inl2, 2, outl, outp);
 	dlerr[sizeof(dlerr) - 1] = 0;
