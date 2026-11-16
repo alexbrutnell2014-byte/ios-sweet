@@ -2,7 +2,7 @@
 # Phone tools. From ios-flame phone/tools (MIT): netsvc (publishes wland's utun to configd), nettest, lsreg
 # (LaunchServices registration, -r rebuilds), psx (processes; -k NAME kills), oslog (unified log), prefs
 # (CFPreferences), imgtest (ImageIO decode check), openapp (launch an app), exq (extension records).
-# Ours: cmdd (runs commands the PC drops in /var/local/cmd; tools/surya-run.py), reboot (restart / -h power off), kmsg (the kernel log, or its lines with a pattern).
+# Ours: cmdd (runs commands the PC drops in /var/local/cmd; tools/surya-run.py), reboot (restart / -h power off), kmsg (the kernel log, or its lines with a pattern), pstack (sampled thread stacks, from ios-flame).
 set -e
 cd "$(dirname "$0")"
 mkdir -p out
@@ -18,6 +18,7 @@ $CC -Wall -o out/mvf mvf.c && sign mvf
 $CC -Wall -o out/untar untar.c && sign untar
 $CC -Wall -o out/reboot reboot.c && sign reboot
 $CC -Wall -o out/kmsg kmsg.c && sign kmsg
+$CC -Wall -o out/pstack pstack.c && sign pstack
 for m in oslog prefs openapp exq; do $CC -fobjc-arc -framework Foundation -o out/$m $m.m && sign $m; done
 $CC -fobjc-arc -framework Foundation -framework MobileCoreServices -o out/lsreg lsreg.m && sign lsreg
 $CC -fobjc-arc -framework Foundation -framework ImageIO -framework CoreGraphics -o out/imgtest imgtest.m && sign imgtest
