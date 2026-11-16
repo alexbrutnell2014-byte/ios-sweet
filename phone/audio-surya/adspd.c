@@ -1408,8 +1408,25 @@ static int tone(unsigned secs)
 	if (steps < 3)
 		goto out;
 	pins_on();
-	clock_on = afe_clock(1) == 0;
-	if (!clock_on || steps < 4)
+	/* ADSPD_CLK: 2 the AFE service's clock set (v2, as sm6150's machine driver; hung once), 1 the port's own
+	 * LPAIF clock config (clk-ver 1), 0 none (the port is started without a clock request) */
+	{
+		const char *ce = getenv("ADSPD_CLK");
+		unsigned clk = ce ? (unsigned)atoi(ce) : 2;
+		LOG("tone: clock mode %u", clk);
+		if (clk == 2) {
+			clock_on = afe_clock(1) == 0;
+			if (!clock_on)
+				goto out;
+		} else if (clk == 1) {
+			struct { uint32_t version, bit_hz, osr_hz; uint16_t src, root, mode, reserved; } __attribute__((packed))
+				lc = { 1, RATE * BITS * 2, 0, 1 /* internal */, 0 /* default root */, 1 /* clk1 valid */, 0 };
+			if (afe_port_param("port 0x1004: LPAIF bit clock 1.536 MHz, internal", AFE_MODULE_AUDIO_DEV_INTERFACE,
+					   0x00010238u /* AFE_PARAM_ID_LPAIF_CLK_CONFIG */, &lc, sizeof(lc)))
+				goto out;
+		}
+	}
+	if (steps < 4)
 		goto out;
 	port_on = cmd("port 0x1004, start", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_START, start, sizeof(start), 0) == 0;
 	if (!port_on)
