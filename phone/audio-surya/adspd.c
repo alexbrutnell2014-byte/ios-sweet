@@ -751,6 +751,8 @@ static int rx_one(void)
 	return 1;
 }
 
+static void frpc_service(void);
+
 static int poll_for(unsigned ms)
 {
 	uint64_t end = now_ms() + ms;
@@ -759,6 +761,7 @@ static int poll_for(unsigned ms)
 		while (rx_one())
 			n++;
 		smp2p_service();
+		frpc_service();
 		if (ms)
 			usleep(1000);
 	} while (now_ms() < end);
@@ -1349,19 +1352,23 @@ static void smmu_report_and_off(int which)
 #define VMID_ADSP_HEAP		37
 #define PERM_RWX		7
 
-static int frpc_got, frpc_retval;
-static uint64_t frpc_ctx_back;
+static struct { int got; int32_t retval; } frpc_rsp[16];
 
 static void frpc_rx(const uint8_t *d, uint32_t n)
 {
+	uint64_t ctx;
+	int32_t retval;
 	if (n < 12) {
 		LOG("fastrpc: < %u bytes (short)", n);
 		return;
 	}
-	memcpy(&frpc_ctx_back, d, 8);
-	memcpy(&frpc_retval, d + 8, 4);
-	frpc_got = 1;
-	LOG("fastrpc: < response: ctx %#llx retval %d (%u bytes)", (unsigned long long)frpc_ctx_back, frpc_retval, n);
+	memcpy(&ctx, d, 8);
+	memcpy(&retval, d + 8, 4);
+	unsigned id = (unsigned)(ctx >> 4) & 15;
+	frpc_rsp[id].retval = retval;
+	frpc_rsp[id].got = 1;
+	if (id != 2)
+		LOG("fastrpc: < response: ctx %#llx retval %d", (unsigned long long)ctx, retval);
 }
 
 /* TrustZone MP_ASSIGN (Linux qcom_scm_assign_mem): HLOS -> LPASS + ADSP heap, read/write/exec. */
@@ -1436,20 +1443,462 @@ static int audiopd_start(void)
 	struct { int32_t client_id, tid; uint64_t ctx; uint32_t handle, sc; uint64_t addr, size; } __attribute__((packed)) msg = {
 		0, (int32_t)getpid(), (1u << 4) | 1 /* ctx id 1, USER_PD */, 1 /* FASTRPC_INIT_HANDLE */,
 		(8u << 24) | (3u << 16) /* FASTRPC_SCALARS(INIT_CREATE_STATIC, 3, 0) */, dsp, (pkt + 4095) & ~4095u };
-	frpc_got = 0;
+	frpc_rsp[1].got = 0;
 	LOG("fastrpc: > create static \"audiopd\": buffer %#llx (%u bytes), heap %#llx+%#llx", (unsigned long long)dsp, pkt,
 	    (unsigned long long)HEAP_PA, (unsigned long long)HEAP_SIZE);
 	if (ch_send(c, &msg, sizeof(msg)))
 		return -1;
 	uint64_t end = now_ms() + 5000;
-	while (now_ms() < end && !frpc_got)
+	while (now_ms() < end && !frpc_rsp[1].got)
 		poll_for(5);
-	if (!frpc_got) {
+	if (!frpc_rsp[1].got) {
 		LOG("fastrpc: no response in 5 s");
 		return -1;
 	}
-	LOG("fastrpc: audiopd %s (retval %d)", frpc_retval == 0 ? "STARTED" : "REFUSED", frpc_retval);
-	return frpc_retval == 0 ? 0 : -1;
+	int32_t rv = frpc_rsp[1].retval;
+	LOG("fastrpc: audiopd %s (retval %d)", rv == 0 ? "STARTED" : "REFUSED", rv);
+	return rv == 0 ? 0 : -1;
+}
+
+/* ---- FastRPC invokes, and the listener: the audio PD's calls back to us (files, logs) ----
+ *
+ * As quic/fastrpc (BSD-3-Clause): adsp_default_listener.c (open "adsp_default_listener" through the DSP's
+ * remotectl, handle 0, and register), listener_android.c (adsp_listener, handle 3: init2, then next2 in a loop:
+ * each answer is one call of the DSP's to a module of ours, packed as listener_buf.h; the next next2 carries its
+ * result back), apps_remotectl (our handle 0: the DSP opens our modules by name) and apps_std (files). The
+ * invoke buffers live in RAM below 4 GB that nothing uses, seen by the DSP through stream 0x1b23 like the
+ * audiopd start's: the synchronous calls' at FRPC_BUF_PA, the listener's 4 MB at 0xa1c00000 (behind the remote
+ * heap). Files are served read-only from DSP_DIRS (the phone's own /vendor/dsp, copied from backup\dsp.img).
+ */
+#define AEE_EFAILED_		0x01
+#define AEE_EBADPARM_		0x0e
+#define AEE_EUNSUPPORTED_	0x14
+#define AEE_ERESOURCENOTFOUND_	0x16
+#define AEE_ENOSUCHMOD_		0x3e
+#define AEE_ENOSUCHFILE_	0x45
+#define AEE_EBADSIZE_		0x4d
+#define SCALARS(m, in, out)	(((uint32_t)(m) << 24) | ((uint32_t)(in) << 16) | ((uint32_t)(out) << 8))
+#define LSN_PA			0xa1c00000ull
+#define LSN_SIZE		0x00400000u
+#define LSN_IN_CAP		0x00040000u		/* a request's packed input buffers: 256 KB */
+#define H_APPS_STD		0x100
+#define H_APPS_MEM		0x101
+#define H_MSGD			0x102
+
+static const char *const dsp_dirs[] = { "/var/local/fw/dsp/adsp", "/var/local/fw/dsp" };
+
+/* An invoke's buffer at `pa' (fastrpc_get_args): metadata, then each argument 128-byte aligned. Inputs are
+ * copied in; outputs get their offsets in outoff[]. Returns the packet's size, 0 when it does not fit. */
+static uint32_t frpc_build(uint64_t pa, uint32_t cap, int nin, const void *const *ind, const uint32_t *inl, int nout,
+			   const uint32_t *outl, uint32_t *outoff)
+{
+	int nsc = nin + nout;
+	uint32_t meta = (16 + 8 + 16) * (uint32_t)nsc + 8 * 16 + 4 * 64, off = meta;
+	uint8_t hdr[16 * 40 + 8 * 16 + 4 * 64] = { 0 };
+	uint64_t dsp = FRPC_ADDR(pa);
+	if (nsc > 16)
+		return 0;
+	uint64_t *rpra = (uint64_t *)hdr;
+	uint32_t *list = (uint32_t *)(hdr + 16 * nsc);
+	uint64_t *pages = (uint64_t *)(hdr + 24 * nsc);
+	for (int i = 0; i < nsc; i++) {
+		uint32_t len = i < nin ? inl[i] : outl[i - nin];
+		list[2 * i + 1] = (uint32_t)i;
+		rpra[2 * i + 1] = len;
+		if (!len)
+			continue;
+		off = (off + 127) & ~127u;
+		if (off + len > cap)
+			return 0;
+		uint64_t pv = dsp + off;
+		rpra[2 * i] = pv;
+		list[2 * i] = 1;
+		pages[2 * i] = pv & ~0xfffull;
+		pages[2 * i + 1] = (((pv + len - 1) >> 12) - (pv >> 12) + 1) * 4096;
+		if (i < nin)
+			pm_wr(pa + off, ind[i], len);
+		else
+			outoff[i - nin] = off;
+		off += len;
+	}
+	pm_wr(pa, hdr, meta);
+	return off;
+}
+
+static int frpc_send(int id, int tid, uint32_t handle, uint32_t sc, uint64_t pa, uint32_t pkt)
+{
+	struct { int32_t client_id, tid; uint64_t ctx; uint32_t handle, sc; uint64_t addr, size; } __attribute__((packed)) m = {
+		(int32_t)getpid(), tid, ((uint64_t)id << 4) | 1 /* USER_PD */, handle, sc, FRPC_ADDR(pa), (pkt + 4095) & ~4095u };
+	frpc_rsp[id].got = 0;
+	return ch_send(&chans[2], &m, sizeof(m));
+}
+
+/* A synchronous call (context 1): inputs in, outputs copied to out[] (each outl[] bytes). The DSP's result, or -1. */
+static int32_t frpc_call(const char *what, uint32_t handle, uint32_t sc, int nin, const void *const *ind, const uint32_t *inl,
+			 int nout, const uint32_t *outl, void *const *out)
+{
+	uint32_t outoff[8] = { 0 };
+	uint32_t pkt = frpc_build(FRPC_BUF_PA, 0x10000, nin, ind, inl, nout, outl, outoff);
+	if (!pkt || frpc_send(1, (int)getpid(), handle, sc, FRPC_BUF_PA, pkt))
+		return -1;
+	uint64_t end = now_ms() + 5000;
+	while (now_ms() < end && !frpc_rsp[1].got)
+		poll_for(2);
+	if (!frpc_rsp[1].got) {
+		LOG("fastrpc: %s: no response in 5 s", what);
+		return -1;
+	}
+	for (int j = 0; j < nout; j++)
+		if (outl[j])
+			pm_rd(FRPC_BUF_PA + outoff[j], out[j], outl[j]);
+	LOG("fastrpc: %s -> %d", what, frpc_rsp[1].retval);
+	return frpc_rsp[1].retval;
+}
+
+/* ---- our modules ---- */
+
+static FILE *files[64];
+static uint32_t n_requests;
+
+static FILE *file_of(uint32_t f) { return f && f <= 64 ? files[f - 1] : NULL; }
+
+static uint32_t file_add(FILE *fp)
+{
+	for (uint32_t i = 0; i < 64; i++)
+		if (!files[i]) {
+			files[i] = fp;
+			return i + 1;
+		}
+	fclose(fp);
+	return 0;
+}
+
+static const char *base_name(const char *p) { const char *s = strrchr(p, '/'); return s ? s + 1 : p; }
+
+/* Read-only: the name as given (when under /var/local/fw), else its base name in each of dsp_dirs. */
+static FILE *dsp_open(const char *name, const char *mode, char *found, size_t flen)
+{
+	if (strpbrk(mode, "wa+"))
+		return NULL;
+	if (!strncmp(name, "/var/local/fw/", 14)) {
+		FILE *fp = fopen(name, "rb");
+		if (fp)
+			snprintf(found, flen, "%s", name);
+		return fp;
+	}
+	for (unsigned i = 0; i < sizeof(dsp_dirs) / sizeof(dsp_dirs[0]); i++) {
+		snprintf(found, flen, "%s/%s", dsp_dirs[i], base_name(name));
+		FILE *fp = fopen(found, "rb");
+		if (fp)
+			return fp;
+	}
+	return NULL;
+}
+
+/* A string argument: in[i] with at most len bytes, made safe to print */
+static void str_arg(char *dst, size_t n, const uint8_t *p, uint32_t len)
+{
+	size_t k = len < n - 1 ? len : n - 1;
+	memcpy(dst, p, k);
+	dst[k] = 0;
+}
+
+static int32_t mod_remotectl(uint32_t m, uint8_t **in, uint32_t *inl, int nin, uint8_t **out, uint32_t *outl, int nout)
+{
+	if (m == 0 && nin >= 2 && nout >= 1 && outl[0] >= 8) {	/* open(name, rout handle, rout dlerror, rout nErr) */
+		char name[96];
+		str_arg(name, sizeof(name), in[1], inl[1]);
+		uint32_t h = !strcmp(name, "apps_std") ? H_APPS_STD : !strcmp(name, "apps_mem") ? H_APPS_MEM :
+			     !strcmp(name, "adspmsgd_apps") ? H_MSGD : 0;
+		uint32_t r[2] = { h, h ? 0u : AEE_ENOSUCHMOD_ };
+		memcpy(out[0], r, 8);
+		LOG("listener: the DSP opens our \"%s\" -> %s", name, h ? "handle given" : "WE HAVE NO SUCH MODULE");
+		return 0;
+	}
+	if (m == 1 && nout >= 1 && outl[0] >= 4) {			/* close(handle, rout dlerror, rout nErr) */
+		uint32_t z = 0;
+		memcpy(out[0], &z, 4);
+		return 0;
+	}
+	LOG("listener: remotectl method %u: not handled", m);
+	return AEE_EUNSUPPORTED_;
+}
+
+static const char *std_name(uint32_t m)
+{
+	static const char *const n[] = { "fopen", "freopen", "fflush", "fclose", "fread", "fwrite", "fgetpos", "fsetpos",
+		"ftell", "fseek", "flen", "rewind", "feof", "ferror", "clearerr", "print_string", "getenv", "setenv",
+		"unsetenv", "fopen_with_env", "fgets", "get_search_paths_with_env", "fileExists", "fsync", "fremove",
+		"fdopen_decrypt", "opendir", "closedir", "readdir", "mkdir", "rmdir", "stat", "ftrunc", "frename",
+		"fopen_fd", "fclose_fd", "fopen_with_env_fd" };
+	return m < sizeof(n) / sizeof(n[0]) ? n[m] : "?";
+}
+
+static int32_t mod_apps_std(uint32_t m, uint8_t **in, uint32_t *inl, int nin, uint8_t **out, uint32_t *outl, int nout)
+{
+	uint32_t p[4] = { 0 };
+	if (nin >= 1)
+		memcpy(p, in[0], inl[0] < 16 ? inl[0] : 16);
+	char a[160] = "", b[160] = "", found[200] = "";
+	switch (m) {
+	case 0:		/* fopen(name, mode, rout FILE) */
+	case 19: {	/* fopen_with_env(envvarname, delim, name, mode, rout FILE) */
+		int ni = m == 0 ? 1 : 3, mi = ni + 1;
+		if (nin <= mi || nout < 1 || outl[0] < 4)
+			return AEE_EBADPARM_;
+		str_arg(a, sizeof(a), in[ni], inl[ni]);
+		str_arg(b, sizeof(b), in[mi], inl[mi]);
+		FILE *fp = dsp_open(a, b, found, sizeof(found));
+		uint32_t f = fp ? file_add(fp) : 0;
+		memcpy(out[0], &f, 4);
+		LOG("listener: %s(\"%s\", \"%s\") -> %s", std_name(m), a, b, f ? found : "NOT FOUND");
+		return f ? 0 : AEE_ENOSUCHFILE_;
+	}
+	case 3: {	/* fclose(FILE) */
+		FILE *fp = file_of(p[0]);
+		if (fp) {
+			fclose(fp);
+			files[p[0] - 1] = NULL;
+		}
+		return fp ? 0 : AEE_EBADPARM_;
+	}
+	case 4: {	/* fread(FILE, rout buf, rout bytesRead, rout bEOF) */
+		FILE *fp = file_of(p[0]);
+		if (!fp || nout < 2 || outl[0] < 8)
+			return AEE_EBADPARM_;
+		uint32_t r[2];
+		r[0] = (uint32_t)fread(out[1], 1, outl[1], fp);
+		r[1] = feof(fp) ? 1 : 0;
+		memcpy(out[0], r, 8);
+		return 0;
+	}
+	case 8: {	/* ftell(FILE, rout pos) */
+		FILE *fp = file_of(p[0]);
+		if (!fp || nout < 1)
+			return AEE_EBADPARM_;
+		uint32_t pos = (uint32_t)ftell(fp);
+		memcpy(out[0], &pos, 4);
+		return 0;
+	}
+	case 9: {	/* fseek(FILE, offset, whence) */
+		FILE *fp = file_of(p[0]);
+		return fp && fseek(fp, (long)(int32_t)p[1], (int)p[2]) == 0 ? 0 : AEE_EBADPARM_;
+	}
+	case 10: {	/* flen(FILE, rout uint64) */
+		FILE *fp = file_of(p[0]);
+		if (!fp || nout < 1 || outl[0] < 8)
+			return AEE_EBADPARM_;
+		long cur = ftell(fp);
+		fseek(fp, 0, SEEK_END);
+		uint64_t len = (uint64_t)ftell(fp);
+		fseek(fp, cur, SEEK_SET);
+		memcpy(out[0], &len, 8);
+		return 0;
+	}
+	case 11: {	/* rewind */
+		FILE *fp = file_of(p[0]);
+		if (fp)
+			rewind(fp);
+		return fp ? 0 : AEE_EBADPARM_;
+	}
+	case 12:	/* feof(FILE, rout bEOF) */
+	case 13: {	/* ferror(FILE, rout err) */
+		FILE *fp = file_of(p[0]);
+		if (!fp || nout < 1)
+			return AEE_EBADPARM_;
+		uint32_t v = m == 12 ? (feof(fp) ? 1 : 0) : 0;
+		memcpy(out[0], &v, 4);
+		return 0;
+	}
+	case 15:	/* print_string(str) */
+		if (nin >= 2) {
+			str_arg(a, sizeof(a), in[1], inl[1]);
+			LOG("dsp says: %s", a);
+		}
+		return 0;
+	case 16: {	/* getenv(name, rout val, rout valLenReq) */
+		if (nin < 2 || nout < 2)
+			return AEE_EBADPARM_;
+		str_arg(a, sizeof(a), in[1], inl[1]);
+		const char *v = !strcmp(a, "ADSP_LIBRARY_PATH") ? "/var/local/fw/dsp/adsp;/var/local/fw/dsp" : NULL;
+		LOG("listener: getenv(\"%s\") -> %s", a, v ? v : "(not set)");
+		if (!v)
+			return AEE_ERESOURCENOTFOUND_;
+		uint32_t need = (uint32_t)strlen(v) + 1;
+		memcpy(out[0], &need, 4);
+		if (outl[1])
+			snprintf((char *)out[1], outl[1], "%s", v);
+		return 0;
+	}
+	case 22: {	/* fileExists(path, rout bool) */
+		if (nin < 2 || nout < 1)
+			return AEE_EBADPARM_;
+		str_arg(a, sizeof(a), in[1], inl[1]);
+		FILE *fp = dsp_open(a, "r", found, sizeof(found));
+		uint8_t e = fp ? 1 : 0;
+		if (fp)
+			fclose(fp);
+		memcpy(out[0], &e, 1);
+		LOG("listener: fileExists(\"%s\") -> %s", a, e ? "yes" : "no");
+		return 0;
+	}
+	default:
+		for (int i = 1; i < nin && i < 4; i++) {
+			str_arg(a, sizeof(a), in[i], inl[i]);
+			LOG("listener:   arg %d: \"%s\"", i, a);
+		}
+		LOG("listener: apps_std %s (method %u): NOT HANDLED", std_name(m), m);
+		return AEE_EUNSUPPORTED_;
+	}
+}
+
+/* One call of the DSP's (next2's answer): unpack (listener_buf.h), run, pack the outputs. */
+static int32_t lsn_dispatch(uint32_t handle, uint32_t sc, const uint8_t *req, uint32_t reqlen, uint8_t *resp, uint32_t cap,
+			    uint32_t *resplen)
+{
+	int nin = (int)((sc >> 16) & 0xff), nout = (int)((sc >> 8) & 0xff);
+	uint32_t m = (sc >> 24) & 0x1f, pos = 0, inl[16] = { 0 }, outl[16] = { 0 };
+	uint8_t *in[16] = { 0 }, *out[16] = { 0 };
+	int32_t r;
+	*resplen = 0;
+	if (nin > 16 || nout > 16 || (sc & 0xff))
+		return AEE_EBADPARM_;
+	for (int i = 0; i < nin; i++) {
+		if (pos + 4 > reqlen)
+			return AEE_EBADPARM_;
+		memcpy(&inl[i], req + pos, 4);
+		pos += 4;
+		if (inl[i]) {
+			pos = (pos + 7) & ~7u;
+			if (inl[i] > reqlen - pos)
+				return AEE_EBADPARM_;
+			in[i] = (uint8_t *)req + pos;
+			pos += inl[i];
+		}
+	}
+	for (int j = 0; j < nout; j++) {
+		if (pos + 4 > reqlen)
+			return AEE_EBADPARM_;
+		memcpy(&outl[j], req + pos, 4);
+		pos += 4;
+	}
+	/* where the outputs go in the response (pack_out_bufs), so the modules write them in place */
+	uint32_t o = 0;
+	for (int j = 0; j < nout; j++) {
+		o += 4;
+		if (outl[j]) {
+			o = (o + 7) & ~7u;
+			if (outl[j] > cap || o > cap - outl[j])
+				return AEE_EBADSIZE_;
+			out[j] = resp + o;
+			memset(out[j], 0, outl[j]);
+			o += outl[j];
+		}
+	}
+	n_requests++;
+	if (handle == 0)
+		r = mod_remotectl(m, in, inl, nin, out, outl, nout);
+	else if (handle == H_APPS_STD)
+		r = mod_apps_std(m, in, inl, nin, out, outl, nout);
+	else if (handle == H_MSGD) {
+		char a[200] = "";
+		if (nin >= 2) {
+			str_arg(a, sizeof(a), in[1], inl[1]);
+			LOG("dsp log: %s", a);
+		}
+		r = 0;
+	} else {
+		LOG("listener: handle %#x method %u (%d in, %d out): NOT HANDLED", handle, m, nin, nout);
+		r = AEE_EUNSUPPORTED_;
+	}
+	if (r == 0) {
+		o = 0;
+		for (int j = 0; j < nout; j++) {
+			memcpy(resp + o, &outl[j], 4);
+			o += 4;
+			if (outl[j])
+				o = ((o + 7) & ~7u) + outl[j];
+		}
+		*resplen = o;
+	}
+	return r;
+}
+
+static int lsn_on, lsn_busy;
+static uint32_t lsn_outoff[2];
+static uint8_t *lsn_req, *lsn_resp;
+
+static int lsn_next(uint32_t prev_ctx, int32_t prev_result, const uint8_t *prev, uint32_t prevlen)
+{
+	uint32_t prim[4] = { prev_ctx, (uint32_t)prev_result, prevlen, LSN_IN_CAP };
+	const void *ind[2] = { prim, prev };
+	uint32_t inl[2] = { 16, prevlen }, outl[2] = { 16, LSN_IN_CAP };
+	uint32_t pkt = frpc_build(LSN_PA, LSN_SIZE, 2, ind, inl, 2, outl, lsn_outoff);
+	if (!pkt) {
+		LOG("listener: a response of %u bytes does not fit", prevlen);
+		return -1;
+	}
+	return frpc_send(2, (int)getpid() + 1, 3 /* adsp_listener */, SCALARS(4 /* next2 */, 2, 2), LSN_PA, pkt);
+}
+
+/* From poll_for: a call of the DSP's has come (next2 answered): serve it and ask for the next. */
+static void frpc_service(void)
+{
+	if (!lsn_on || lsn_busy || !frpc_rsp[2].got)
+		return;
+	lsn_busy = 1;
+	frpc_rsp[2].got = 0;
+	if (frpc_rsp[2].retval != 0) {
+		LOG("listener: next2 -> %d: the listener stops", frpc_rsp[2].retval);
+		lsn_on = 0;
+		lsn_busy = 0;
+		return;
+	}
+	uint32_t prim[4];
+	pm_rd(LSN_PA + lsn_outoff[0], prim, 16);
+	uint32_t ctx = prim[0], handle = prim[1], sc = prim[2], need = prim[3], got = need < LSN_IN_CAP ? need : LSN_IN_CAP;
+	pm_rd(LSN_PA + lsn_outoff[1], lsn_req, got);
+	uint32_t resplen = 0;
+	int32_t r = need > LSN_IN_CAP ? AEE_EBADSIZE_ :
+		    lsn_dispatch(handle, sc, lsn_req, got, lsn_resp, LSN_SIZE - LSN_IN_CAP - 0x2000, &resplen);
+	if (r && handle != H_MSGD)
+		LOG("listener: call ctx %#x handle %#x sc %#x -> %d", ctx, handle, sc, r);
+	if (lsn_next(ctx, r, lsn_resp, r ? 0 : resplen))
+		lsn_on = 0;
+	lsn_busy = 0;
+}
+
+/* The listener up (init2, the first next2), then registered as the static PD's default listener. */
+static int listener_start(void)
+{
+	if (!lsn_req) {
+		lsn_req = malloc(LSN_IN_CAP);
+		lsn_resp = malloc(LSN_SIZE);
+	}
+	if (!lsn_req || !lsn_resp)
+		return -1;
+	int32_t r = frpc_call("adsp_listener init2", 3, SCALARS(3, 0, 0), 0, NULL, NULL, 0, NULL, NULL);
+	if (r)
+		return -1;
+	lsn_on = 1;
+	if (lsn_next(0, -1, NULL, 0)) {
+		lsn_on = 0;
+		return -1;
+	}
+	const char name[] = "adsp_default_listener";
+	uint32_t prim_in[2] = { sizeof(name), 128 }, prim_out[2] = { 0, 0 };
+	char dlerr[128] = "";
+	const void *ind[2] = { prim_in, name };
+	uint32_t inl[2] = { 8, sizeof(name) }, outl[2] = { 8, sizeof(dlerr) };
+	void *outp[2] = { prim_out, dlerr };
+	r = frpc_call("remotectl open \"adsp_default_listener\"", 0, SCALARS(0, 2, 2), 2, ind, inl, 2, outl, outp);
+	dlerr[sizeof(dlerr) - 1] = 0;
+	LOG("fastrpc: adsp_default_listener: handle %#x nErr %#x%s%s", prim_out[0], prim_out[1], dlerr[0] ? " dlerror " : "",
+	    dlerr);
+	if (r || prim_out[1])
+		return -1;
+	r = frpc_call("adsp_default_listener register", prim_out[0], SCALARS(0, 0, 0), 0, NULL, NULL, 0, NULL, NULL);
+	return r ? -1 : 0;
 }
 
 /* 1 kHz at 48 kHz, -20 dBFS: one cycle */
@@ -1494,7 +1943,10 @@ static int tone(unsigned secs)
 		if (!pe || atoi(pe)) {
 			if (audiopd_start())
 				goto out;
-			poll_for(500);	/* let the PD come up and register */
+			if (listener_start())
+				LOG("tone: the listener did not start (going on)");
+			poll_for(3000);	/* let the PD come up, asking for what it needs */
+			LOG("tone: the DSP made %u calls to us so far", n_requests);
 		}
 	}
 	if (steps == 0) {
