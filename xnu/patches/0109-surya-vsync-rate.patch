@@ -1,0 +1,50 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 338e368..5930d39 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -116,6 +116,13 @@ enum {
+ #define SWEET_FB_NOTIFY_TYPES           8
+ #define SWEET_FB_NOTIFY_VSYNC           5
+ #define SWEET_FB_VSYNC_US               16667
++/*
++ * The vsync tick backboardd paces its frames on (boot-arg sweetfb_vsync_hz, 30-240, default 60). Core
++ * Animation starts a frame on a tick: a frame whose GPU work takes 21 ms at 60 Hz waits for the second tick,
++ * so scrolling sat at 30 fps; at 90 Hz the same frame takes two 11.1 ms ticks (45 fps). The panel copies the
++ * latest frame on each tick (sweetfb_hz still divides only below 60).
++ */
++static uint32_t sweet_fb_vsync_hz = 60;
+ #define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
+ /*
+  * The iOS userland only has status bar / layout data for real iPhone
+@@ -291,7 +298,12 @@ AppleCLCD::start(IOService *provider)
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+-	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
++	uint32_t vhz = 60;
++	if (PE_parse_boot_argn("sweetfb_vsync_hz", &vhz, sizeof(vhz)) && vhz >= 30 && vhz <= 240) {
++		sweet_fb_vsync_hz = vhz;
++	}
++	fVsync->setTimeoutUS(1000000u / sweet_fb_vsync_hz);
++	IOLog("SWEET FB: vsync %u Hz\n", sweet_fb_vsync_hz);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+@@ -316,7 +328,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	 * ~40 Hz with jitter, and backboardd paces its frames on it.
+ 	 */
+ 	if (fb->fVsyncAbs == 0) {
+-		nanoseconds_to_absolutetime(SWEET_FB_VSYNC_US * 1000ULL, &fb->fVsyncAbs);
++		nanoseconds_to_absolutetime(1000000000ULL / sweet_fb_vsync_hz, &fb->fVsyncAbs);
+ 		fb->fNextVsync = now;
+ 	}
+ 	fb->fNextVsync += fb->fVsyncAbs;
+@@ -324,7 +336,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		fb->fNextVsync = now + fb->fVsyncAbs;
+ 	}
+ 	sender->wakeAtTime(fb->fNextVsync);
+-	if ((count % 300) == 0) {
++	if ((count % (5u * sweet_fb_vsync_hz)) == 0) {
+ 		/* Every 5 s: frames backboardd swapped, frames copied to the panel. */
+ 		uint64_t swaps = sweet_fb_swap_count - fb->fStatSwaps, ns = 0;
+ 		absolutetime_to_nanoseconds(fb->fStatPresentAbs, &ns);
