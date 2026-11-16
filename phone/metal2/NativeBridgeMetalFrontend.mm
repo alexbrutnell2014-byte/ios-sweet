@@ -1547,14 +1547,20 @@ static char sweetMemoryOwnerKey;
 @end
 
 // The device queries the runtime answers (nmb_device_answer_selector), as methods of the device class. One without an argument is read once
-// and installed only where the device has an answer of its own; one with an argument asks the runtime each call, and a refusal answers 0/NO
-// with the reason logged.
+// and installed only where the device has an answer of its own; one with an argument asks the runtime once per argument and keeps the
+// answer (the device's answers never change; Core Animation asks supportsFamily: and the like on every frame, and each ask walks Apple's
+// family tables: 9% of the display thread while scrolling), and a refusal answers 0/NO with the reason logged once.
 static std::unordered_map<SEL,uint64_t> gAnswers;
 static NSUInteger countAnswer(id,SEL cmd) {return (NSUInteger)gAnswers.at(cmd);}
 static BOOL flagAnswer(id,SEL cmd) {return gAnswers.at(cmd)!=0;}
+struct AskKeyHash {size_t operator()(const std::pair<SEL,NSUInteger> &k) const {return std::hash<const void *>()(k.first)*31u^std::hash<NSUInteger>()(k.second);}};
+static std::mutex gAskLock;
+static std::unordered_map<std::pair<SEL,NSUInteger>,uint64_t,AskKeyHash> gAsked;
 static uint64_t askAnswer(SEL cmd,NSUInteger arg) {
+ {std::lock_guard<std::mutex> lock(gAskLock);auto it=gAsked.find({cmd,arg});if(it!=gAsked.end())return it->second;}
  uint64_t value=0;
- if(!nmb_device_answer(gDevice,sel_getName(cmd),arg,&value)){NBLOG(@"native-metal: %s(%lu): %@",sel_getName(cmd),(unsigned long)arg,lastError());return 0;}
+ if(!nmb_device_answer(gDevice,sel_getName(cmd),arg,&value)){NBLOG(@"native-metal: %s(%lu): %@",sel_getName(cmd),(unsigned long)arg,lastError());value=0;}
+ std::lock_guard<std::mutex> lock(gAskLock);gAsked[{cmd,arg}]=value;
  return value;
 }
 static NSUInteger countArgAnswer(id,SEL cmd,NSUInteger arg) {return (NSUInteger)askAnswer(cmd,arg);}
