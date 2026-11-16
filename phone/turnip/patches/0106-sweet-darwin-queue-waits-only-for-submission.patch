@@ -1,0 +1,46 @@
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
+index 9b05b03..cc44f20 100644
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -740,6 +740,26 @@ darwin_sync_wait(struct tu_device *device, struct vk_darwin_sync *s, uint64_t ab
+    }
+ }
+ 
++/*
++ * sweet: a semaphore wait before a submission only has to see the signalling submission IN the ring: the kernel
++ * has one ring for every client, which the GPU runs in order (each job's fence write flushes the caches), so a job
++ * queued after it cannot start before it. Waiting for its fence on the CPU (darwin_sync_wait) drained the GPU before
++ * every chained submission: metal2vulkan chains ~50 a frame, and each one left the GPU idle ~330 us while the CPU
++ * woke and submitted the next (half of every frame idle while scrolling). Only a wait-before-signal still blocks,
++ * until the signal is submitted.
++ */
++static VkResult
++darwin_sync_wait_submitted(struct tu_device *device, struct vk_darwin_sync *s)
++{
++   if (s->state != DARWIN_SYNC_UNSIGNALED)
++      return VK_SUCCESS;
++   pthread_mutex_lock(&device->submit_mutex);
++   while (s->state == DARWIN_SYNC_UNSIGNALED)
++      pthread_cond_wait(&device->timeline_cond, &device->submit_mutex);
++   pthread_mutex_unlock(&device->submit_mutex);
++   return VK_SUCCESS;
++}
++
+ static VkResult
+ vk_darwin_sync_wait(struct vk_device *_device, struct vk_sync *sync, uint64_t wait_value,
+                     enum vk_sync_wait_flags wait_flags, uint64_t abs_timeout_ns)
+@@ -860,10 +880,12 @@ darwin_queue_submit(struct tu_queue *queue, void *_submit,
+    struct tu_darwin_queue_submit *submit = (struct tu_darwin_queue_submit *)_submit;
+    struct tu_device *dev = queue->device;
+ 
+-   /* The kernel client has one ring and no GPU-side waits: wait on the CPU before submitting. */
++   /* The kernel client has one ring, run in order, and no GPU-side waits: a wait only needs its signal queued
++    * (darwin_sync_wait_submitted). TU_DARWIN_CPU_WAITS=1 brings back the full CPU wait. */
++   static const bool cpu_waits = debug_get_bool_option("TU_DARWIN_CPU_WAITS", false);
+    for (uint32_t i = 0; i < wait_count; i++) {
+       struct vk_darwin_sync *s = container_of(waits[i].sync, struct vk_darwin_sync, vk);
+-      VkResult result = darwin_sync_wait(dev, s, UINT64_MAX);
++      VkResult result = cpu_waits ? darwin_sync_wait(dev, s, UINT64_MAX) : darwin_sync_wait_submitted(dev, s);
+       if (result != VK_SUCCESS)
+          return vk_device_set_lost(&dev->vk, "wait before submit failed");
+    }
