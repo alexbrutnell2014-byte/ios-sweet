@@ -1148,8 +1148,8 @@ static int apr_event(const struct apr_hdr *h, const uint32_t *w, uint32_t len)
 static int cmd(const char *what, uint8_t svc, uint16_t port, uint32_t opcode, const void *p, uint32_t len, uint32_t want)
 {
 	if (apr_ask_port(svc, port, opcode, p, len, 1500)) {
-		LOG("tone: %s: NO ANSWER in 1.5 s; listening 8 s more", what);
-		uint64_t end = now_ms() + 8000;
+		LOG("tone: %s: NO ANSWER in 1.5 s; listening 3 s more", what);
+		uint64_t end = now_ms() + 3000;
 		while (now_ms() < end && !apr_ans.got)
 			poll_for(10);
 		LOG("tone: %s: %s (adsp state %x)", what, apr_ans.got ? "a LATE answer came" : "still nothing", adsp_state);
@@ -1356,6 +1356,25 @@ static int tone(unsigned secs)
 	if (secs > 10)
 		secs = 10;
 	LOG("tone: up to step %u", steps);
+	if (steps == 0) {
+		/* probes that touch nothing: which services answer, and more than once? */
+		uint32_t bogus = 0x1234;
+		uint8_t gp[16 + sizeof(struct afe_param)] = { 0 };
+		struct afe_param ph = { AFE_MODULE_AUDIO_DEV_INTERFACE, AFE_PARAM_ID_I2S_CONFIG, 20, 0 };
+		*(uint16_t *)gp = AFE_PORT;
+		*(uint16_t *)(gp + 2) = (uint16_t)(sizeof(ph) + 20);
+		memcpy(gp + 16, &ph, sizeof(ph));
+		for (int round = 0; round < 2; round++) {
+			cmd("probe: core state", APR_SVC_CORE, 0, AVCS_GET_STATE, NULL, 0, AVCS_GET_STATE_RSP);
+			cmd("probe: ASM unmap of a bogus handle", APR_SVC_ASM, 0, ASM_CMD_SHARED_MEM_UNMAP_REGIONS, &bogus,
+			    sizeof(bogus), 0);
+			cmd("probe: core state", APR_SVC_CORE, 0, AVCS_GET_STATE, NULL, 0, AVCS_GET_STATE_RSP);
+			cmd("probe: AFE get port 0x1004's I2S config", APR_SVC_AFE, 0, 0x000100f0u /* GET_PARAM_V2 */, gp,
+			    sizeof(gp), 0x00010106u /* GET_PARAM_V2 response */);
+			cmd("probe: core state", APR_SVC_CORE, 0, AVCS_GET_STATE, NULL, 0, AVCS_GET_STATE_RSP);
+		}
+		goto out;
+	}
 	if (smmu_audio_identity())
 		goto out;
 	/*
